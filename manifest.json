@@ -1,0 +1,14 @@
+{
+  "manifest_version": 3,
+  "name": "Ccfolia SW2.5 Dice Cut-in Helper",
+  "version": "1.0.0",
+  "description": "ソード・ワールド2.5のダイス結果に応じて自動でカットインコマンドを入力・送信します。",
+  "permissions": [],
+  "content_scripts": [
+    {
+      "matches": ["https://ccfolia.com/rooms/*"],
+      "js": ["content.js"],
+      "run_at": "document_idle"
+    }
+  ]
+}
