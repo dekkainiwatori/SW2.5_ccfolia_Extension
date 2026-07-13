@@ -9,12 +9,21 @@ let isSendingCommand = false;
 
 /**
  * 1. Find the chat container element dynamically.
- * Uses a heuristic approach (scrollable ancestor of the textarea) to support minified class names.
+ * パフォーマンス向上のため、body全体ではなく、チャット入力欄(textarea)の周辺コンテナを監視対象とします。
  */
 function findChatContainer() {
-  // ココフォリアなどのモダンSPAでは、DOM構造の入れ子が深く動的なため
-  // body要素全体を監視対象とするのが最も確実です。
-  return document.body;
+  const textarea = document.querySelector('textarea');
+  if (!textarea) {
+    return null;
+  }
+
+  // テキストエリアの祖先要素を遡り、チャットログと入力欄を包含する領域を推定する
+  // ココフォリアの難読化クラス名に依存せず、DOMの階層をたどることで構造変更に強くしています
+  let container = textarea;
+  for (let i = 0; i < 8 && container.parentElement; i++) {
+    container = container.parentElement;
+  }
+  return container;
 }
 
 /**
