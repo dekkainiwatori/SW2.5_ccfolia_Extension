@@ -7,6 +7,42 @@ let chatObserver = null;
 let observedContainer = null;
 let isSendingCommand = false;
 
+// Tab visibility state (to prevent queued messages firing when switching back to tab)
+let isTabJustFocused = false;
+let tabFocusTimeout = null;
+
+// Track previously processed message texts to prevent firing on DOM remounts
+const processedMessages = new Set();
+const processedMessagesQueue = [];
+
+function markProcessed(text) {
+  if (!text) return;
+  const t = text.trim();
+  if (!t) return;
+  if (!processedMessages.has(t)) {
+    processedMessages.add(t);
+    processedMessagesQueue.push(t);
+    if (processedMessagesQueue.length > 200) {
+      const oldest = processedMessagesQueue.shift();
+      processedMessages.delete(oldest);
+    }
+  }
+}
+
+document.addEventListener('visibilitychange', () => {
+  if (document.hidden) {
+    isTabJustFocused = true;
+    clearTimeout(tabFocusTimeout);
+  } else {
+    isTabJustFocused = true;
+    clearTimeout(tabFocusTimeout);
+    // Ignore messages for 1.5 seconds after tab becomes visible
+    tabFocusTimeout = setTimeout(() => {
+      isTabJustFocused = false;
+    }, 1500);
+  }
+});
+
 /**
  * 1. Find the chat container element dynamically.
  * パフォーマンス向上のため、body全体ではなく、チャット入力欄(textarea)の周辺コンテナを監視対象とします。
@@ -149,35 +185,82 @@ function sendChatMessage(command) {
   }, 100);
 }
 
+// メッセージの最小単位（リーフノード）から、一意のシグネチャ（名前・時刻・内容を含むテキスト）を生成する
+function getMessageSignature(leafNode) {
+  let signatureNode = leafNode;
+  let signature = signatureNode.textContent || "";
+  // 構造を数階層遡り、名前や時刻を含む親コンテナを探す
+  for (let i = 0; i < 3; i++) {
+    if (signatureNode.parentElement && signatureNode.parentElement.textContent.length < 500) {
+      signatureNode = signatureNode.parentElement;
+      signature = signatureNode.textContent || "";
+    } else {
+      break; // コンテナが巨大すぎる（親要素が全体リストなど）場合はストップ
+    }
+  }
+  return signature.trim();
+}
+
 /**
- * 5. Handle a newly added message node.
- * Filters out system commands and prevents infinite loop.
+ * 追加されたノードの中から個々のメッセージ要素を抽出し、処理する
  */
-function handleNewMessage(node) {
+function processIndividualMessages(rootNode) {
   if (isSendingCommand) return;
+  if (document.hidden || isTabJustFocused) return;
 
-  const text = node.textContent || "";
+  const allElements = [rootNode, ...Array.from(rootNode.querySelectorAll('*'))];
+  const leafMessages = [];
 
-  // Prevent infinite loop if the log records our own command
-  if (text.includes('@クリティカル') || text.includes('@ファンブル') || text.includes('@自動成功') || text.includes('@自動失敗')) {
-    return;
+  // ダイス結果を含む最小単位の要素（リーフノード）を探す
+  for (const el of allElements) {
+    const text = el.textContent || "";
+    if (text.includes('＞') || text.includes('>')) {
+      let childHasMarker = false;
+      for (const child of el.children) {
+        const childText = child.textContent || "";
+        if (childText.includes('＞') || childText.includes('>')) {
+          childHasMarker = true;
+          break;
+        }
+      }
+      if (!childHasMarker) {
+        leafMessages.push(el);
+      }
+    }
   }
 
-  const action = parseDiceResult(text);
-  if (!action) return;
+  // 見つかった個々のメッセージに対して処理を実行
+  for (const leaf of leafMessages) {
+    const diceText = leaf.textContent || "";
+    const signature = getMessageSignature(leaf);
 
-  const command = determineCommand(action);
-  if (!command) return;
+    if (processedMessages.has(signature)) {
+      continue; // 既に処理済みの完全一致メッセージ（リマウント等）は無視
+    }
 
-  console.log(`[Ccfolia SW2.5 Helper] Detected event:`, action, `-> Sending: ${command}`);
+    if (diceText.includes('@クリティカル') || diceText.includes('@ファンブル') || diceText.includes('@自動成功') || diceText.includes('@自動失敗')) {
+      markProcessed(signature);
+      continue;
+    }
 
-  // Prevent double triggers with short cooldown/lock
-  isSendingCommand = true;
-  sendChatMessage(command);
-  
-  setTimeout(() => {
-    isSendingCommand = false;
-  }, 1500);
+    const action = parseDiceResult(diceText);
+    if (!action) continue;
+
+    const command = determineCommand(action);
+    if (!command) continue;
+
+    console.log(`[Ccfolia SW2.5 Helper] Detected event:`, action, `-> Sending: ${command}`);
+
+    markProcessed(signature);
+
+    // Prevent double triggers with short cooldown
+    isSendingCommand = true;
+    sendChatMessage(command);
+    
+    setTimeout(() => {
+      isSendingCommand = false;
+    }, 1500);
+  }
 }
 
 /**
@@ -194,16 +277,59 @@ function startChatObserver() {
   observedContainer = container;
   console.log('[Ccfolia SW2.5 Helper] Observer initialized. Monitoring chat updates...');
 
+  // 初期化時に、現在DOMに存在する既存のメッセージを個別に解析し「処理済み」として登録する
+  // 複数メッセージの結合文字列ではなく、後で抽出されるのと同じ「シグネチャ」で登録することが重要
+  const allElements = container.querySelectorAll('*');
+  const leafMessages = [];
+  for (const el of allElements) {
+    const text = el.textContent || "";
+    if (text.includes('＞') || text.includes('>')) {
+      let childHasMarker = false;
+      for (const child of el.children) {
+        const childText = child.textContent || "";
+        if (childText.includes('＞') || childText.includes('>')) {
+          childHasMarker = true;
+          break;
+        }
+      }
+      if (!childHasMarker) {
+        leafMessages.push(el);
+      }
+    }
+  }
+
+  for (const leaf of leafMessages) {
+    const signature = getMessageSignature(leaf);
+    markProcessed(signature);
+  }
+
+  let pendingNodes = [];
+  let processingTimeout = null;
+
   chatObserver = new MutationObserver((mutations) => {
     for (const mutation of mutations) {
       if (mutation.type === 'childList') {
         for (const node of mutation.addedNodes) {
           if (node.nodeType === Node.ELEMENT_NODE) {
-            handleNewMessage(node);
+            pendingNodes.push(node);
           }
         }
       }
     }
+
+    // デバウンス処理: 複数の一括追加を検知するため、わずかに待つ
+    clearTimeout(processingTimeout);
+    processingTimeout = setTimeout(() => {
+      // 1回の描画サイクルで大量のノードが追加された場合は、再描画(リマウント)や初期読み込みとみなして無視する
+      if (pendingNodes.length > 5) {
+        console.log(`[Ccfolia SW2.5 Helper] Ignored ${pendingNodes.length} nodes due to bulk render.`);
+      } else {
+        for (const node of pendingNodes) {
+          processIndividualMessages(node);
+        }
+      }
+      pendingNodes = [];
+    }, 50);
   });
 
   chatObserver.observe(container, {
