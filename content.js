@@ -10,32 +10,40 @@ let isSendingCommand = false;
 // Tab visibility state (to prevent queued messages firing when switching back to tab)
 let isTabJustFocused = false;
 let tabFocusTimeout = null;
+let lastVisibleTime = Date.now();
 
-// Track previously processed message texts to prevent firing on DOM remounts
-const processedMessages = new Set();
-const processedMessagesQueue = [];
+// Track processed message signatures and their occurrence counts
+const processedSignatureCounts = new Map();
+const processedSignaturesQueue = [];
+const processedNodes = new WeakSet();
 
-function markProcessed(text) {
-  if (!text) return;
-  const t = text.trim();
-  if (!t) return;
-  if (!processedMessages.has(t)) {
-    processedMessages.add(t);
-    processedMessagesQueue.push(t);
-    if (processedMessagesQueue.length > 200) {
-      const oldest = processedMessagesQueue.shift();
-      processedMessages.delete(oldest);
+function markProcessed(signature) {
+  if (!signature) return;
+  const sig = signature.trim();
+  if (!sig) return;
+  
+  const currentCount = processedSignatureCounts.get(sig) || 0;
+  processedSignatureCounts.set(sig, currentCount + 1);
+  
+  processedSignaturesQueue.push(sig);
+  if (processedSignaturesQueue.length > 1000) {
+    const oldest = processedSignaturesQueue.shift();
+    const count = processedSignatureCounts.get(oldest) || 0;
+    if (count <= 1) {
+      processedSignatureCounts.delete(oldest);
+    } else {
+      processedSignatureCounts.set(oldest, count - 1);
     }
   }
 }
 
 document.addEventListener('visibilitychange', () => {
+  clearTimeout(tabFocusTimeout);
   if (document.hidden) {
     isTabJustFocused = true;
-    clearTimeout(tabFocusTimeout);
   } else {
     isTabJustFocused = true;
-    clearTimeout(tabFocusTimeout);
+    lastVisibleTime = Date.now();
     // Ignore messages for 1.5 seconds after tab becomes visible
     tabFocusTimeout = setTimeout(() => {
       isTabJustFocused = false;
@@ -204,8 +212,14 @@ function getMessageSignature(leafNode) {
 /**
  * 追加されたノードの中から個々のメッセージ要素を抽出し、処理する
  */
-function processIndividualMessages(rootNode) {
+function processIndividualMessages(rootNode, domSignatureCounts) {
   if (isSendingCommand) return;
+  
+  // フェイルセーフ: タブ復帰時のフラグ解除チェック
+  if (isTabJustFocused && !document.hidden && Date.now() - lastVisibleTime > 2000) {
+    isTabJustFocused = false;
+  }
+  
   if (document.hidden || isTabJustFocused) return;
 
   const allElements = [rootNode, ...Array.from(rootNode.querySelectorAll('*'))];
@@ -231,11 +245,25 @@ function processIndividualMessages(rootNode) {
 
   // 見つかった個々のメッセージに対して処理を実行
   for (const leaf of leafMessages) {
+    if (processedNodes.has(leaf)) {
+      continue; // DOMノード自体がすでに処理済みなら無視
+    }
+    processedNodes.add(leaf);
+
     const diceText = leaf.textContent || "";
     const signature = getMessageSignature(leaf);
 
-    if (processedMessages.has(signature)) {
-      continue; // 既に処理済みの完全一致メッセージ（リマウント等）は無視
+    const currentDOMCount = domSignatureCounts.get(signature) || 0;
+    const processedCount = processedSignatureCounts.get(signature) || 0;
+
+    // 削除対応: 現在のDOM数より記録された処理済数の方が多い場合は、記録を同期する
+    if (currentDOMCount < processedCount) {
+      processedSignatureCounts.set(signature, currentDOMCount);
+    }
+
+    // すでに処理済みのカウント以下の場合は過去ログとみなしてスキップ
+    if (currentDOMCount <= (processedSignatureCounts.get(signature) || 0)) {
+      continue;
     }
 
     if (diceText.includes('@クリティカル') || diceText.includes('@ファンブル') || diceText.includes('@自動成功') || diceText.includes('@自動失敗')) {
@@ -277,8 +305,11 @@ function startChatObserver() {
   observedContainer = container;
   console.log('[Ccfolia SW2.5 Helper] Observer initialized. Monitoring chat updates...');
 
+  // 初期化時に件数とキューをリセットして再構築
+  processedSignatureCounts.clear();
+  processedSignaturesQueue.length = 0;
+
   // 初期化時に、現在DOMに存在する既存のメッセージを個別に解析し「処理済み」として登録する
-  // 複数メッセージの結合文字列ではなく、後で抽出されるのと同じ「シグネチャ」で登録することが重要
   const allElements = container.querySelectorAll('*');
   const leafMessages = [];
   for (const el of allElements) {
@@ -299,6 +330,7 @@ function startChatObserver() {
   }
 
   for (const leaf of leafMessages) {
+    processedNodes.add(leaf);
     const signature = getMessageSignature(leaf);
     markProcessed(signature);
   }
@@ -320,13 +352,35 @@ function startChatObserver() {
     // デバウンス処理: 複数の一括追加を検知するため、わずかに待つ
     clearTimeout(processingTimeout);
     processingTimeout = setTimeout(() => {
-      // 1回の描画サイクルで大量のノードが追加された場合は、再描画(リマウント)や初期読み込みとみなして無視する
-      if (pendingNodes.length > 5) {
-        console.log(`[Ccfolia SW2.5 Helper] Ignored ${pendingNodes.length} nodes due to bulk render.`);
-      } else {
-        for (const node of pendingNodes) {
-          processIndividualMessages(node);
+      if (pendingNodes.length === 0) return;
+
+      // 1. DOM全体をスキャンし、各シグネチャの現在の出現回数をマップ化
+      const domSignatureCounts = new Map();
+      const currentContainer = findChatContainer();
+      if (currentContainer) {
+        const els = currentContainer.querySelectorAll('*');
+        for (const el of els) {
+          const text = el.textContent || "";
+          if (text.includes('＞') || text.includes('>')) {
+            let childHasMarker = false;
+            for (const child of el.children) {
+              const childText = child.textContent || "";
+              if (childText.includes('＞') || childText.includes('>')) {
+                childHasMarker = true;
+                break;
+              }
+            }
+            if (!childHasMarker) {
+              const sig = getMessageSignature(el);
+              domSignatureCounts.set(sig, (domSignatureCounts.get(sig) || 0) + 1);
+            }
+          }
         }
+      }
+
+      // 2. スキップせず、すべての追加ノードに対して処理を実行
+      for (const node of pendingNodes) {
+        processIndividualMessages(node, domSignatureCounts);
       }
       pendingNodes = [];
     }, 50);
@@ -347,7 +401,8 @@ if (document.readyState === 'loading') {
 
 // Dynamic recovery for Single Page Application (SPA) view updates / room changes
 setInterval(() => {
-  if (chatObserver && (!document.body.contains(observedContainer) || !findChatContainer())) {
+  const currentContainer = findChatContainer();
+  if (chatObserver && (!document.body.contains(observedContainer) || currentContainer !== observedContainer)) {
     console.log('[Ccfolia SW2.5 Helper] Chat container detached or changed. Re-initializing...');
     chatObserver.disconnect();
     chatObserver = null;
