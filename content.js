@@ -2,292 +2,44 @@
  * Ccfolia SW2.5 Dice Cut-in Helper Content Script
  */
 
-// State variables
-let chatObserver = null;
-let observedContainer = null;
+// Configuration constants
+const CONFIG = {
+  COMMAND_DELAY: 500,                  // Delay between sending queued messages (ms)
+  REACT_TRIGGER_DELAY: 100,            // Delay before triggering Enter/click (ms)
+  TAB_FOCUS_IGNORE_DURATION: 1500,     // Ignore messages duration after tab visibility changes (ms)
+  OBSERVER_RECONNECT_INTERVAL: 3000,   // Interval to check for detached/changed chat container (ms)
+  MAX_SIGNATURE_QUEUE_SIZE: 1000,      // Max size of processed signatures queue
+  MAX_TEXT_CONTENT_LENGTH: 3000,       // Max text length for message signature container
+  MAX_DOM_SEARCH_DEPTH: 8,             // Search depth to find the chat container
+  MAX_SIGNATURE_SEARCH_DEPTH: 4,       // Search depth to find signature node
+  MAX_TEXTAREA_SEARCH_DEPTH: 5,        // Search depth for button/textarea proximity search
+  BULK_RENDER_THRESHOLD: 5,            // Threshold of nodes to trigger silent sync (skip sending commands)
+  CHAT_TEXTAREA_KEYWORDS: ['送信', 'チャット', 'Enter', 'メッセージ']
+};
 
-// Command queue variables to prevent message collisions
-const commandQueue = [];
-let isProcessingQueue = false;
-
-function queueChatMessage(command) {
-  commandQueue.push(command);
-  processCommandQueue();
-}
-
-function processCommandQueue() {
-  if (isProcessingQueue || commandQueue.length === 0) return;
-  isProcessingQueue = true;
-  
-  const command = commandQueue.shift();
-  sendChatMessage(command);
-  
-  setTimeout(() => {
-    isProcessingQueue = false;
-    processCommandQueue();
-  }, 500); // 500ms delay between sending messages
-}
-
-function splitMultiRolls(text) {
-  if (/#1\s+/.test(text)) {
-    return text.split(/#\d+\s*/).filter(p => p.trim().length > 0);
-  }
-  return [text];
-}
-
-// Tab visibility state (to prevent queued messages firing when switching back to tab)
-let isTabJustFocused = false;
-let tabFocusTimeout = null;
-let lastVisibleTime = Date.now();
-
-// Track processed message signatures and their occurrence counts
-const processedSignatureCounts = new Map();
-const processedSignaturesQueue = [];
-const processedNodes = new WeakSet();
-
-function markProcessed(signature) {
-  if (!signature) return;
-  const sig = signature.trim();
-  if (!sig) return;
-  
-  const currentCount = processedSignatureCounts.get(sig) || 0;
-  processedSignatureCounts.set(sig, currentCount + 1);
-  
-  processedSignaturesQueue.push(sig);
-  if (processedSignaturesQueue.length > 1000) {
-    const oldest = processedSignaturesQueue.shift();
-    const count = processedSignatureCounts.get(oldest) || 0;
-    if (count <= 1) {
-      processedSignatureCounts.delete(oldest);
-    } else {
-      processedSignatureCounts.set(oldest, count - 1);
-    }
-  }
-}
-
-document.addEventListener('visibilitychange', () => {
-  clearTimeout(tabFocusTimeout);
-  if (document.hidden) {
-    isTabJustFocused = true;
-  } else {
-    isTabJustFocused = true;
-    lastVisibleTime = Date.now();
-    // Ignore messages for 1.5 seconds after tab becomes visible
-    tabFocusTimeout = setTimeout(() => {
-      isTabJustFocused = false;
-    }, 1500);
-  }
-});
+// Global state
+const state = {
+  chatObserver: null,
+  observedContainer: null,
+  commandQueue: [],
+  isProcessingQueue: false,
+  isTabJustFocused: false,
+  tabFocusTimeout: null,
+  lastVisibleTime: Date.now(),
+  processedSignatureCounts: new Map(),
+  processedSignaturesQueue: [],
+  processedNodes: new WeakSet()
+};
 
 /**
- * 複数のtextareaが存在する中から、チャット入力用のものを特定する。
- * 送信ボタンが近くにあるものをチャット入力欄と判断します。
+ * Extract leaf elements (minimum message units) containing SW2.5 dice markers.
+ * Filters out elements that have children also containing the markers.
  */
-function getChatTextarea() {
-  const textareas = document.querySelectorAll('textarea');
-  if (textareas.length === 0) return null;
-  if (textareas.length === 1) return textareas[0];
-
-  // 1. placeholder にチャット欄特有のキーワードがあるか優先チェック（キャラシ誤認防止）
-  for (const ta of textareas) {
-    const ph = ta.placeholder || "";
-    if (ph.includes('送信') || ph.includes('チャット') || ph.includes('Enter') || ph.includes('メッセージ')) {
-      return ta;
-    }
-  }
-
-  // 2. 送信ボタンが近くにあるものを探す
-  for (const ta of textareas) {
-    let parent = ta.parentElement;
-    for (let i = 0; i < 5 && parent; i++) {
-      const buttons = parent.querySelectorAll('button');
-      if (buttons.length > 0) {
-        return ta;
-      }
-      parent = parent.parentElement;
-    }
-  }
-  // 3. 見つからない場合は一番最後の要素をフォールバックとする
-  return textareas[textareas.length - 1];
-}
-
-/**
- * 1. Find the chat container element dynamically.
- * パフォーマンス向上のため、body全体ではなく、チャット入力欄(textarea)の周辺コンテナを監視対象とします。
- */
-function findChatContainer() {
-  const textarea = getChatTextarea();
-  if (!textarea) {
-    return null;
-  }
-
-  // テキストエリアの祖先要素を遡り、チャットログと入力欄を包含する領域を推定する
-  // ココフォリアの難読化クラス名に依存せず、DOMの階層をたどることで構造変更に強くしています
-  let container = textarea;
-  for (let i = 0; i < 8 && container.parentElement; i++) {
-    container = container.parentElement;
-  }
-  return container;
-}
-
-/**
- * 2. Parse the text content of a new message node using regex.
- * Detects "自動的失敗" (fumble) or "[number]回転" (critical) for Sword World 2.5.
- */
-function parseDiceResult(text) {
-  // Check if it is likely a dice bot output (contains arrow separator '＞' or '>')
-  const isDiceRoll = text.includes('＞') || text.includes('>');
-  if (!isDiceRoll) return [];
-
-  const actions = [];
-
-  // Check for "[number]回転" (Power Table Critical) - matchAllで複数回転に対応
-  const rotationMatches = [...text.matchAll(/(\d+)\s*回転/g)];
-  for (const match of rotationMatches) {
-    actions.push({ type: 'critical', rotations: parseInt(match[1], 10) });
-  }
-
-  // Check for "自動的失敗" (Power Table Fumble)
-  if (/自動的失敗/.test(text)) {
-    actions.push({ type: 'fumble', rotations: 0 });
-  }
-
-  // 1. Skill Check: Exclude monster damage marked by [D]
-  const isSkillCheck = text.includes('(2D6') && !text.includes('[D]');
-
-  // 2. Detect Skill Check Fumble (1,1) - 修正値対応として [1,1] や "自動失敗" を検知
-  if (isSkillCheck && (text.includes('[1,1]') || text.includes('自動失敗'))) {
-    actions.push({ type: 'skill_fumble', rotations: 0 });
-  }
-
-  // 3. Detect Skill Check Critical (6,6) - 修正値対応として [6,6] や "自動成功" を検知
-  if (isSkillCheck && (text.includes('[6,6]') || text.includes('自動成功'))) {
-    actions.push({ type: 'skill_critical', rotations: 0 });
-  }
-
-  return actions;
-}
-
-/**
- * 3. Map the parsed action to a chat command.
- * Designed for future extensibility (e.g., sending different commands based on rotation count).
- */
-function determineCommand(action) {
-  if (action.type === 'fumble') {
-    return '@ファンブル';
-  }
-  
-  if (action.type === 'skill_fumble') {
-    return '@自動失敗';
-  }
-  
-  if (action.type === 'critical') {
-    // Future extensibility: Customize command based on action.rotations
-    // e.g., if (action.rotations >= 3) return '@スーパークリティカル';
-    return '@クリティカル';
-  }
-  
-  if (action.type === 'skill_critical') {
-    return '@自動成功';
-  }
-  
-  return null;
-}
-
-/**
- * 4. Input and send a message via React-controlled textarea.
- */
-function sendChatMessage(command) {
-  const textarea = getChatTextarea();
-  if (!textarea) {
-    console.error('[Ccfolia SW2.5 Helper] Textarea not found!');
-    return;
-  }
-
-  // テキストエリアにフォーカスを当てる（Reactがアクティブ状態を要求する場合があるため）
-  textarea.focus();
-
-  // Bypass React 15/16+ state binding using native value setter
-  const nativeInputValueSetter = Object.getOwnPropertyDescriptor(
-    window.HTMLTextAreaElement.prototype,
-    "value"
-  ).set;
-  nativeInputValueSetter.call(textarea, command);
-
-  // Trigger event to notify React of the input change
-  textarea.dispatchEvent(new Event('input', { bubbles: true }));
-  // 念のため change イベントも発火
-  textarea.dispatchEvent(new Event('change', { bubbles: true }));
-
-  // Wait briefly for React to update its state, then trigger Enter and click
-  setTimeout(() => {
-    // 1. Enterキーのキーボードイベントを完全なシーケンスで発火 (keydown -> keypress -> keyup)
-    // Reactはkeyupなどで送信をフックしている場合があるため、すべて発火させる
-    const eventParams = {
-      key: 'Enter',
-      code: 'Enter',
-      keyCode: 13,
-      which: 13,
-      bubbles: true,
-      cancelable: true
-    };
-    textarea.dispatchEvent(new KeyboardEvent('keydown', eventParams));
-    textarea.dispatchEvent(new KeyboardEvent('keypress', eventParams));
-    textarea.dispatchEvent(new KeyboardEvent('keyup', eventParams));
-
-    // 2. フォールバック: 送信ボタンを探してクリック
-    let sendButton = null;
-    let parent = textarea.parentElement;
-    for (let i = 0; i < 5 && parent; i++) { // 探索範囲を少し広げる
-      const buttons = parent.querySelectorAll('button');
-      if (buttons.length > 0) {
-        // 複数ある場合は一番最後（通常は送信ボタン）を取得
-        sendButton = buttons[buttons.length - 1];
-        break;
-      }
-      parent = parent.parentElement;
-    }
-
-    if (sendButton) {
-      sendButton.click();
-    }
-  }, 100);
-}
-
-// メッセージの最小単位（リーフノード）から、親メッセージのDOMコンテナを取得する
-function getMessageSignatureNode(leafNode) {
-  let signatureNode = leafNode;
-  // 構造を数階層遡り、名前や時刻を含む親コンテナを探す（長文やx5に対応するため、3000文字かつ4階層まで拡張）
-  for (let i = 0; i < 4; i++) {
-    if (signatureNode.parentElement && signatureNode.parentElement.textContent.length < 3000) {
-      signatureNode = signatureNode.parentElement;
-    } else {
-      break;
-    }
-  }
-  return signatureNode;
-}
-
-// 親メッセージのDOMコンテナから一意のシグネチャ文字列を取得する
-function getMessageSignature(leafNode) {
-  return getMessageSignatureNode(leafNode).textContent.trim();
-}
-
-/**
- * 追加されたノードの中から個々のメッセージ要素を抽出し、処理する
- */
-function processIndividualMessages(rootNode, domSignatureCounts) {
-  // フェイルセーフ: タブ復帰時のフラグ解除チェック
-  if (isTabJustFocused && !document.hidden && Date.now() - lastVisibleTime > 2000) {
-    isTabJustFocused = false;
-  }
-  
-  if (document.hidden || isTabJustFocused) return;
-
+function extractLeafMessages(rootNode) {
+  if (!rootNode) return [];
   const allElements = [rootNode, ...Array.from(rootNode.querySelectorAll('*'))];
   const leafMessages = [];
 
-  // ダイス結果を含む最小単位の要素（リーフノード）を探す
   for (const el of allElements) {
     const text = el.textContent || "";
     if (text.includes('＞') || text.includes('>')) {
@@ -304,37 +56,339 @@ function processIndividualMessages(rootNode, domSignatureCounts) {
       }
     }
   }
+  return leafMessages;
+}
 
-  // このバッチ内で処理したシグネチャを追跡し、同一メッセージ内の複数リーフによる多重処理を防ぐ
+/**
+ * Queue a chat command to prevent message collisions
+ */
+function queueChatMessage(command) {
+  state.commandQueue.push(command);
+  processCommandQueue();
+}
+
+function processCommandQueue() {
+  if (state.isProcessingQueue || state.commandQueue.length === 0) return;
+  state.isProcessingQueue = true;
+  
+  const command = state.commandQueue.shift();
+  sendChatMessage(command);
+  
+  setTimeout(() => {
+    state.isProcessingQueue = false;
+    processCommandQueue();
+  }, CONFIG.COMMAND_DELAY);
+}
+
+/**
+ * Split multi-rolls (e.g. #1 ..., #2 ...)
+ */
+function splitMultiRolls(text) {
+  if (/#1\s+/.test(text)) {
+    return text.split(/#\d+\s*/).filter(p => p.trim().length > 0);
+  }
+  return [text];
+}
+
+/**
+ * Mark a signature as processed, managing the queue size
+ */
+function markProcessed(signature) {
+  if (!signature) return;
+  const sig = signature.trim();
+  if (!sig) return;
+  
+  const currentCount = state.processedSignatureCounts.get(sig) || 0;
+  state.processedSignatureCounts.set(sig, currentCount + 1);
+  
+  state.processedSignaturesQueue.push(sig);
+  if (state.processedSignaturesQueue.length > CONFIG.MAX_SIGNATURE_QUEUE_SIZE) {
+    const oldest = state.processedSignaturesQueue.shift();
+    const count = state.processedSignatureCounts.get(oldest) || 0;
+    if (count <= 1) {
+      state.processedSignatureCounts.delete(oldest);
+    } else {
+      state.processedSignatureCounts.set(oldest, count - 1);
+    }
+  }
+}
+
+// Track tab visibility changes
+document.addEventListener('visibilitychange', () => {
+  clearTimeout(state.tabFocusTimeout);
+  if (document.hidden) {
+    state.isTabJustFocused = true;
+  } else {
+    state.isTabJustFocused = true;
+    state.lastVisibleTime = Date.now();
+    // Ignore messages for a brief period after tab becomes visible
+    state.tabFocusTimeout = setTimeout(() => {
+      state.isTabJustFocused = false;
+    }, CONFIG.TAB_FOCUS_IGNORE_DURATION);
+  }
+});
+
+/**
+ * Locate the chat textarea among multiple textareas
+ */
+function getChatTextarea() {
+  const textareas = document.querySelectorAll('textarea');
+  if (textareas.length === 0) return null;
+  if (textareas.length === 1) return textareas[0];
+
+  // 1. Check placeholder keywords (prevent matching character sheets)
+  for (const ta of textareas) {
+    const ph = ta.placeholder || "";
+    if (CONFIG.CHAT_TEXTAREA_KEYWORDS.some(kw => ph.includes(kw))) {
+      return ta;
+    }
+  }
+
+  // 2. Proximity search: find textarea near a button
+  for (const ta of textareas) {
+    let parent = ta.parentElement;
+    for (let i = 0; i < CONFIG.MAX_TEXTAREA_SEARCH_DEPTH && parent; i++) {
+      const buttons = parent.querySelectorAll('button');
+      if (buttons.length > 0) {
+        return ta;
+      }
+      parent = parent.parentElement;
+    }
+  }
+  
+  // 3. Fallback to the last textarea
+  return textareas[textareas.length - 1];
+}
+
+/**
+ * Find the chat container dynamically by climbing up from textarea
+ */
+function findChatContainer() {
+  const textarea = getChatTextarea();
+  if (!textarea) return null;
+
+  let container = textarea;
+  for (let i = 0; i < CONFIG.MAX_DOM_SEARCH_DEPTH && container.parentElement; i++) {
+    container = container.parentElement;
+  }
+  return container;
+}
+
+/**
+ * Parse SW2.5 dice bot results to identify fumble/critical conditions
+ */
+function parseDiceResult(text) {
+  const isDiceRoll = text.includes('＞') || text.includes('>');
+  if (!isDiceRoll) return [];
+
+  const actions = [];
+
+  // 1. Critical rolls (e.g. "3回転")
+  const rotationMatches = [...text.matchAll(/(\d+)\s*回転/g)];
+  for (const match of rotationMatches) {
+    actions.push({ type: 'critical', rotations: parseInt(match[1], 10) });
+  }
+
+  // 2. Fumble rolls on power tables ("自動的失敗")
+  if (/自動的失敗/.test(text)) {
+    actions.push({ type: 'fumble', rotations: 0 });
+  }
+
+  // 3. Skill checks (2D6)
+  const isSkillCheck = text.includes('(2D6') && !text.includes('[D]');
+
+  // Fumble (1,1) or "自動失敗"
+  if (isSkillCheck && (text.includes('[1,1]') || text.includes('自動失敗'))) {
+    actions.push({ type: 'skill_fumble', rotations: 0 });
+  }
+
+  // Critical (6,6) or "自動成功"
+  if (isSkillCheck && (text.includes('[6,6]') || text.includes('自動成功'))) {
+    actions.push({ type: 'skill_critical', rotations: 0 });
+  }
+
+  return actions;
+}
+
+/**
+ * Determine the exact chat command corresponding to a parsed action
+ */
+function determineCommand(action) {
+  switch (action.type) {
+    case 'fumble':
+      return '@ファンブル';
+    case 'skill_fumble':
+      return '@自動失敗';
+    case 'critical':
+      return '@クリティカル';
+    case 'skill_critical':
+      return '@自動成功';
+    default:
+      return null;
+  }
+}
+
+/**
+ * Insert and send a command in the Ccfolia React chat interface
+ */
+function sendChatMessage(command) {
+  const textarea = getChatTextarea();
+  if (!textarea) {
+    console.error('[Ccfolia SW2.5 Helper] Textarea not found!');
+    return;
+  }
+
+  textarea.focus();
+
+  // Bypass React state binding via native value setter
+  const nativeInputValueSetter = Object.getOwnPropertyDescriptor(
+    window.HTMLTextAreaElement.prototype,
+    "value"
+  ).set;
+  nativeInputValueSetter.call(textarea, command);
+
+  // Notify React of the input state change
+  textarea.dispatchEvent(new Event('input', { bubbles: true }));
+  textarea.dispatchEvent(new Event('change', { bubbles: true }));
+
+  setTimeout(() => {
+    // 1. Dispatch full sequence of keyboard events for Enter key
+    const eventParams = {
+      key: 'Enter',
+      code: 'Enter',
+      keyCode: 13,
+      which: 13,
+      bubbles: true,
+      cancelable: true
+    };
+    textarea.dispatchEvent(new KeyboardEvent('keydown', eventParams));
+    textarea.dispatchEvent(new KeyboardEvent('keypress', eventParams));
+    textarea.dispatchEvent(new KeyboardEvent('keyup', eventParams));
+
+    // 2. Proximity search fallback: find and click the send button
+    let sendButton = null;
+    let parent = textarea.parentElement;
+    for (let i = 0; i < CONFIG.MAX_TEXTAREA_SEARCH_DEPTH && parent; i++) {
+      const buttons = parent.querySelectorAll('button');
+      if (buttons.length > 0) {
+        sendButton = buttons[buttons.length - 1];
+        break;
+      }
+      parent = parent.parentElement;
+    }
+
+    if (sendButton) {
+      sendButton.click();
+    }
+  }, CONFIG.REACT_TRIGGER_DELAY);
+}
+
+/**
+ * Traverse DOM up to locate signature container (containing character name/time)
+ */
+function getMessageSignatureNode(leafNode) {
+  let signatureNode = leafNode;
+  for (let i = 0; i < CONFIG.MAX_SIGNATURE_SEARCH_DEPTH; i++) {
+    if (signatureNode.parentElement && signatureNode.parentElement.textContent.length < CONFIG.MAX_TEXT_CONTENT_LENGTH) {
+      signatureNode = signatureNode.parentElement;
+    } else {
+      break;
+    }
+  }
+  return signatureNode;
+}
+
+/**
+ * Retrieve unique signature string of a message node
+ */
+function getMessageSignature(leafNode) {
+  return getMessageSignatureNode(leafNode).textContent.trim();
+}
+
+/**
+ * Map current occurrences of all chat signatures on DOM
+ */
+function countDOMSignatures(container) {
+  const domSignatureCounts = new Map();
+  if (!container) return domSignatureCounts;
+
+  const leafMessages = extractLeafMessages(container);
+  const countedNodes = new Set();
+
+  for (const leaf of leafMessages) {
+    const sigNode = getMessageSignatureNode(leaf);
+    if (!countedNodes.has(sigNode)) {
+      countedNodes.add(sigNode);
+      const sig = sigNode.textContent.trim();
+      domSignatureCounts.set(sig, (domSignatureCounts.get(sig) || 0) + 1);
+    }
+  }
+  return domSignatureCounts;
+}
+
+/**
+ * Clean up state signatures that no longer exist on DOM (garbage collection)
+ */
+function gcProcessedSignatures(domSignatureCounts) {
+  for (const [sig, processedCount] of state.processedSignatureCounts.entries()) {
+    const domCount = domSignatureCounts.get(sig) || 0;
+    if (domCount < processedCount) {
+      if (domCount === 0) {
+        state.processedSignatureCounts.delete(sig);
+      } else {
+        state.processedSignatureCounts.set(sig, domCount);
+      }
+    }
+  }
+}
+
+/**
+ * Silent sync of new nodes (typically for initial renders or bulk loading)
+ */
+function syncNodesSilently(nodes) {
+  for (const node of nodes) {
+    const leafMessages = extractLeafMessages(node);
+    for (const leaf of leafMessages) {
+      state.processedNodes.add(leaf);
+      const signature = getMessageSignature(leaf);
+      markProcessed(signature);
+    }
+  }
+}
+
+/**
+ * Process a single message node, parse dice results, and queue commands if appropriate
+ */
+function processIndividualMessages(rootNode, domSignatureCounts) {
+  // Grace period to recover isTabJustFocused flag
+  if (state.isTabJustFocused && !document.hidden && Date.now() - state.lastVisibleTime > 2000) {
+    state.isTabJustFocused = false;
+  }
+  
+  if (document.hidden || state.isTabJustFocused) return;
+
+  const leafMessages = extractLeafMessages(rootNode);
   const uniqueSignatures = new Set();
 
-  // 見つかった個々のメッセージに対して処理を実行
   for (const leaf of leafMessages) {
-    if (processedNodes.has(leaf)) {
-      continue; // DOMノード自体がすでに処理済みなら無視
-    }
-    processedNodes.add(leaf);
+    if (state.processedNodes.has(leaf)) continue;
+    state.processedNodes.add(leaf);
 
     const signature = getMessageSignature(leaf);
-    if (uniqueSignatures.has(signature)) {
-      continue; // 同一メッセージは1バッチ内で1度だけ処理する
-    }
+    if (uniqueSignatures.has(signature)) continue;
     uniqueSignatures.add(signature);
 
     const currentDOMCount = domSignatureCounts.get(signature) || 0;
-    const processedCount = processedSignatureCounts.get(signature) || 0;
+    const processedCount = state.processedSignatureCounts.get(signature) || 0;
 
-    // すでに処理済みのカウント以下の場合は過去ログとみなしてスキップ
-    if (currentDOMCount <= processedCount) {
-      continue;
-    }
+    if (currentDOMCount <= processedCount) continue;
 
+    // Avoid self-trigger loops: skip messages containing auto-injected commands
     if (signature.includes('@クリティカル') || signature.includes('@ファンブル') || signature.includes('@自動成功') || signature.includes('@自動失敗')) {
       markProcessed(signature);
       continue;
     }
 
-    // マルチロール（x5など）の分割対応
     const rolls = splitMultiRolls(signature);
     let matchedAny = false;
 
@@ -362,40 +416,21 @@ function processIndividualMessages(rootNode, domSignatureCounts) {
 function startChatObserver() {
   const container = findChatContainer();
   if (!container) {
-    // Retry finding the chat container
     setTimeout(startChatObserver, 1000);
     return;
   }
 
-  observedContainer = container;
+  state.observedContainer = container;
   console.log('[Ccfolia SW2.5 Helper] Observer initialized. Monitoring chat updates...');
 
-  // 初期化時に件数とキューをリセットして再構築
-  processedSignatureCounts.clear();
-  processedSignaturesQueue.length = 0;
+  // Reset tracking lists on start
+  state.processedSignatureCounts.clear();
+  state.processedSignaturesQueue.length = 0;
 
-  // 初期化時に、現在DOMに存在する既存のメッセージを個別に解析し「処理済み」として登録する
-  const allElements = container.querySelectorAll('*');
-  const leafMessages = [];
-  for (const el of allElements) {
-    const text = el.textContent || "";
-    if (text.includes('＞') || text.includes('>')) {
-      let childHasMarker = false;
-      for (const child of el.children) {
-        const childText = child.textContent || "";
-        if (childText.includes('＞') || childText.includes('>')) {
-          childHasMarker = true;
-          break;
-        }
-      }
-      if (!childHasMarker) {
-        leafMessages.push(el);
-      }
-    }
-  }
-
+  // Mark all existing messages as processed initially
+  const leafMessages = extractLeafMessages(container);
   for (const leaf of leafMessages) {
-    processedNodes.add(leaf);
+    state.processedNodes.add(leaf);
     const signature = getMessageSignature(leaf);
     markProcessed(signature);
   }
@@ -403,7 +438,7 @@ function startChatObserver() {
   let pendingNodes = [];
   let processingTimeout = null;
 
-  chatObserver = new MutationObserver((mutations) => {
+  state.chatObserver = new MutationObserver((mutations) => {
     for (const mutation of mutations) {
       if (mutation.type === 'childList') {
         for (const node of mutation.addedNodes) {
@@ -414,86 +449,26 @@ function startChatObserver() {
       }
     }
 
-    // デバウンス処理: 複数の一括追加を検知するため、わずかに待つ
+    // Debounce processing to handle rapid consecutive node additions
     clearTimeout(processingTimeout);
     processingTimeout = setTimeout(() => {
       if (pendingNodes.length === 0) return;
 
-      // 1. DOM全体をスキャンし、各シグネチャの現在の出現回数をマップ化（重複排除付き）
-      const domSignatureCounts = new Map();
       const currentContainer = findChatContainer();
-      if (currentContainer) {
-        const els = currentContainer.querySelectorAll('*');
-        const countedNodes = new Set(); // 同一メッセージノードが二重カウントされるのを防ぐ
+      const domSignatureCounts = countDOMSignatures(currentContainer);
 
-        for (const el of els) {
-          const text = el.textContent || "";
-          if (text.includes('＞') || text.includes('>')) {
-            let childHasMarker = false;
-            for (const child of el.children) {
-              const childText = child.textContent || "";
-              if (childText.includes('＞') || childText.includes('>')) {
-                childHasMarker = true;
-                break;
-              }
-            }
-            if (!childHasMarker) {
-              const sigNode = getMessageSignatureNode(el);
-              if (!countedNodes.has(sigNode)) {
-                countedNodes.add(sigNode);
-                const sig = sigNode.textContent.trim();
-                domSignatureCounts.set(sig, (domSignatureCounts.get(sig) || 0) + 1);
-              }
-            }
-          }
-        }
-      }
+      // Clean up old signatures no longer present on DOM
+      gcProcessedSignatures(domSignatureCounts);
 
-      // ガベージコレクション: DOM上から消えたメッセージを検知し、内部の処理済みカウントを同期して減算する
-      for (const [sig, processedCount] of processedSignatureCounts.entries()) {
-        const domCount = domSignatureCounts.get(sig) || 0;
-        if (domCount < processedCount) {
-          if (domCount === 0) {
-            processedSignatureCounts.delete(sig);
-          } else {
-            processedSignatureCounts.set(sig, domCount);
-          }
-        }
-      }
-
-      // 一括読み込み（5ノード超過）の場合は、コマンドを送信せずサイレントにカウントだけを同期する
-      if (pendingNodes.length > 5) {
+      // Handle massive updates silently (e.g. room load or channel switch)
+      if (pendingNodes.length > CONFIG.BULK_RENDER_THRESHOLD) {
         console.log(`[Ccfolia SW2.5 Helper] Bulk render detected (${pendingNodes.length} nodes). Syncing count silently.`);
-        for (const node of pendingNodes) {
-          const allElements = [node, ...Array.from(node.querySelectorAll('*'))];
-          const leafMessages = [];
-          for (const el of allElements) {
-            const text = el.textContent || "";
-            if (text.includes('＞') || text.includes('>')) {
-              let childHasMarker = false;
-              for (const child of el.children) {
-                const childText = child.textContent || "";
-                if (childText.includes('＞') || childText.includes('>')) {
-                  childHasMarker = true;
-                  break;
-                }
-              }
-              if (!childHasMarker) {
-                leafMessages.push(el);
-              }
-            }
-          }
-          for (const leaf of leafMessages) {
-            processedNodes.add(leaf);
-            const signature = getMessageSignature(leaf);
-            markProcessed(signature);
-          }
-        }
+        syncNodesSilently(pendingNodes);
         pendingNodes = [];
         return;
       }
 
-      // 2. スキップせず、すべての追加ノードに対して処理を実行
+      // Process newly added nodes
       for (const node of pendingNodes) {
         processIndividualMessages(node, domSignatureCounts);
       }
@@ -501,27 +476,27 @@ function startChatObserver() {
     }, 50);
   });
 
-  chatObserver.observe(container, {
+  state.chatObserver.observe(container, {
     childList: true,
-    subtree: true // DOMのどの深さにメッセージが追加されても確実に検知する
+    subtree: true
   });
 }
 
-// Start the observer on load
+// Initial entry point
 if (document.readyState === 'loading') {
   document.addEventListener('DOMContentLoaded', startChatObserver);
 } else {
   startChatObserver();
 }
 
-// Dynamic recovery for Single Page Application (SPA) view updates / room changes
+// Re-initialization recovery for SPAs
 setInterval(() => {
   const currentContainer = findChatContainer();
-  if (chatObserver && (!document.body.contains(observedContainer) || currentContainer !== observedContainer)) {
+  if (state.chatObserver && (!document.body.contains(state.observedContainer) || currentContainer !== state.observedContainer)) {
     console.log('[Ccfolia SW2.5 Helper] Chat container detached or changed. Re-initializing...');
-    chatObserver.disconnect();
-    chatObserver = null;
-    observedContainer = null;
+    state.chatObserver.disconnect();
+    state.chatObserver = null;
+    state.observedContainer = null;
     startChatObserver();
   }
-}, 3000);
+}, CONFIG.OBSERVER_RECONNECT_INTERVAL);
