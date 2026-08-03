@@ -256,13 +256,8 @@ function processIndividualMessages(rootNode, domSignatureCounts) {
     const currentDOMCount = domSignatureCounts.get(signature) || 0;
     const processedCount = processedSignatureCounts.get(signature) || 0;
 
-    // 削除対応: 現在のDOM数より記録された処理済数の方が多い場合は、記録を同期する
-    if (currentDOMCount < processedCount) {
-      processedSignatureCounts.set(signature, currentDOMCount);
-    }
-
     // すでに処理済みのカウント以下の場合は過去ログとみなしてスキップ
-    if (currentDOMCount <= (processedSignatureCounts.get(signature) || 0)) {
+    if (currentDOMCount <= processedCount) {
       continue;
     }
 
@@ -376,6 +371,50 @@ function startChatObserver() {
             }
           }
         }
+      }
+
+      // ガベージコレクション: DOM上から消えたメッセージを検知し、内部の処理済みカウントを同期して減算する
+      for (const [sig, processedCount] of processedSignatureCounts.entries()) {
+        const domCount = domSignatureCounts.get(sig) || 0;
+        if (domCount < processedCount) {
+          if (domCount === 0) {
+            processedSignatureCounts.delete(sig);
+          } else {
+            processedSignatureCounts.set(sig, domCount);
+          }
+        }
+      }
+
+      // 一括読み込み（5ノード超過）の場合は、コマンドを送信せずサイレントにカウントだけを同期する
+      if (pendingNodes.length > 5) {
+        console.log(`[Ccfolia SW2.5 Helper] Bulk render detected (${pendingNodes.length} nodes). Syncing count silently.`);
+        for (const node of pendingNodes) {
+          const allElements = [node, ...Array.from(node.querySelectorAll('*'))];
+          const leafMessages = [];
+          for (const el of allElements) {
+            const text = el.textContent || "";
+            if (text.includes('＞') || text.includes('>')) {
+              let childHasMarker = false;
+              for (const child of el.children) {
+                const childText = child.textContent || "";
+                if (childText.includes('＞') || childText.includes('>')) {
+                  childHasMarker = true;
+                  break;
+                }
+              }
+              if (!childHasMarker) {
+                leafMessages.push(el);
+              }
+            }
+          }
+          for (const leaf of leafMessages) {
+            processedNodes.add(leaf);
+            const signature = getMessageSignature(leaf);
+            markProcessed(signature);
+          }
+        }
+        pendingNodes = [];
+        return;
       }
 
       // 2. スキップせず、すべての追加ノードに対して処理を実行
