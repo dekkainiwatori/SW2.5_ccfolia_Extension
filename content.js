@@ -5,7 +5,35 @@
 // State variables
 let chatObserver = null;
 let observedContainer = null;
-let isSendingCommand = false;
+
+// Command queue variables to prevent message collisions
+const commandQueue = [];
+let isProcessingQueue = false;
+
+function queueChatMessage(command) {
+  commandQueue.push(command);
+  processCommandQueue();
+}
+
+function processCommandQueue() {
+  if (isProcessingQueue || commandQueue.length === 0) return;
+  isProcessingQueue = true;
+  
+  const command = commandQueue.shift();
+  sendChatMessage(command);
+  
+  setTimeout(() => {
+    isProcessingQueue = false;
+    processCommandQueue();
+  }, 500); // 500ms delay between sending messages
+}
+
+function splitMultiRolls(text) {
+  if (/#1\s+/.test(text)) {
+    return text.split(/#\d+\s*/).filter(p => p.trim().length > 0);
+  }
+  return [text];
+}
 
 // Tab visibility state (to prevent queued messages firing when switching back to tab)
 let isTabJustFocused = false;
@@ -236,8 +264,6 @@ function getMessageSignature(leafNode) {
  * 追加されたノードの中から個々のメッセージ要素を抽出し、処理する
  */
 function processIndividualMessages(rootNode, domSignatureCounts) {
-  if (isSendingCommand) return;
-  
   // フェイルセーフ: タブ復帰時のフラグ解除チェック
   if (isTabJustFocused && !document.hidden && Date.now() - lastVisibleTime > 2000) {
     isTabJustFocused = false;
@@ -273,7 +299,6 @@ function processIndividualMessages(rootNode, domSignatureCounts) {
     }
     processedNodes.add(leaf);
 
-    const diceText = leaf.textContent || "";
     const signature = getMessageSignature(leaf);
 
     const currentDOMCount = domSignatureCounts.get(signature) || 0;
@@ -284,28 +309,30 @@ function processIndividualMessages(rootNode, domSignatureCounts) {
       continue;
     }
 
-    if (diceText.includes('@クリティカル') || diceText.includes('@ファンブル') || diceText.includes('@自動成功') || diceText.includes('@自動失敗')) {
+    if (signature.includes('@クリティカル') || signature.includes('@ファンブル') || signature.includes('@自動成功') || signature.includes('@自動失敗')) {
       markProcessed(signature);
       continue;
     }
 
-    const action = parseDiceResult(diceText);
-    if (!action) continue;
+    // マルチロール（x5など）の分割対応
+    const rolls = splitMultiRolls(signature);
+    let matchedAny = false;
 
-    const command = determineCommand(action);
-    if (!command) continue;
+    for (const rollText of rolls) {
+      const action = parseDiceResult(rollText);
+      if (!action) continue;
 
-    console.log(`[Ccfolia SW2.5 Helper] Detected event:`, action, `-> Sending: ${command}`);
+      const command = determineCommand(action);
+      if (!command) continue;
 
-    markProcessed(signature);
+      console.log(`[Ccfolia SW2.5 Helper] Detected event:`, action, `-> Queueing: ${command}`);
+      queueChatMessage(command);
+      matchedAny = true;
+    }
 
-    // Prevent double triggers with short cooldown
-    isSendingCommand = true;
-    sendChatMessage(command);
-    
-    setTimeout(() => {
-      isSendingCommand = false;
-    }, 1500);
+    if (matchedAny) {
+      markProcessed(signature);
+    }
   }
 }
 
