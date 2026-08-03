@@ -88,6 +88,15 @@ function getChatTextarea() {
   if (textareas.length === 0) return null;
   if (textareas.length === 1) return textareas[0];
 
+  // 1. placeholder にチャット欄特有のキーワードがあるか優先チェック（キャラシ誤認防止）
+  for (const ta of textareas) {
+    const ph = ta.placeholder || "";
+    if (ph.includes('送信') || ph.includes('チャット') || ph.includes('Enter') || ph.includes('メッセージ')) {
+      return ta;
+    }
+  }
+
+  // 2. 送信ボタンが近くにあるものを探す
   for (const ta of textareas) {
     let parent = ta.parentElement;
     for (let i = 0; i < 5 && parent; i++) {
@@ -98,7 +107,7 @@ function getChatTextarea() {
       parent = parent.parentElement;
     }
   }
-  // 見つからない場合は一番最後の要素をフォールバックとする
+  // 3. 見つからない場合は一番最後の要素をフォールバックとする
   return textareas[textareas.length - 1];
 }
 
@@ -128,18 +137,19 @@ function findChatContainer() {
 function parseDiceResult(text) {
   // Check if it is likely a dice bot output (contains arrow separator '＞' or '>')
   const isDiceRoll = text.includes('＞') || text.includes('>');
-  if (!isDiceRoll) return null;
+  if (!isDiceRoll) return [];
+
+  const actions = [];
+
+  // Check for "[number]回転" (Power Table Critical) - matchAllで複数回転に対応
+  const rotationMatches = [...text.matchAll(/(\d+)\s*回転/g)];
+  for (const match of rotationMatches) {
+    actions.push({ type: 'critical', rotations: parseInt(match[1], 10) });
+  }
 
   // Check for "自動的失敗" (Power Table Fumble)
   if (/自動的失敗/.test(text)) {
-    return { type: 'fumble', rotations: 0 };
-  }
-
-  // Check for "[number]回転" (Power Table Critical)
-  const rotationMatch = text.match(/(\d+)回転/);
-  if (rotationMatch) {
-    const rotations = parseInt(rotationMatch[1], 10);
-    return { type: 'critical', rotations: rotations };
+    actions.push({ type: 'fumble', rotations: 0 });
   }
 
   // 1. Skill Check: Exclude monster damage marked by [D]
@@ -147,15 +157,15 @@ function parseDiceResult(text) {
 
   // 2. Detect Skill Check Fumble (1,1) - 修正値対応として [1,1] や "自動失敗" を検知
   if (isSkillCheck && (text.includes('[1,1]') || text.includes('自動失敗'))) {
-    return { type: 'skill_fumble', rotations: 0 };
+    actions.push({ type: 'skill_fumble', rotations: 0 });
   }
 
   // 3. Detect Skill Check Critical (6,6) - 修正値対応として [6,6] や "自動成功" を検知
   if (isSkillCheck && (text.includes('[6,6]') || text.includes('自動成功'))) {
-    return { type: 'skill_critical', rotations: 0 };
+    actions.push({ type: 'skill_critical', rotations: 0 });
   }
 
-  return null;
+  return actions;
 }
 
 /**
@@ -244,20 +254,23 @@ function sendChatMessage(command) {
   }, 100);
 }
 
-// メッセージの最小単位（リーフノード）から、一意のシグネチャ（名前・時刻・内容を含むテキスト）を生成する
-function getMessageSignature(leafNode) {
+// メッセージの最小単位（リーフノード）から、親メッセージのDOMコンテナを取得する
+function getMessageSignatureNode(leafNode) {
   let signatureNode = leafNode;
-  let signature = signatureNode.textContent || "";
-  // 構造を数階層遡り、名前や時刻を含む親コンテナを探す
-  for (let i = 0; i < 3; i++) {
-    if (signatureNode.parentElement && signatureNode.parentElement.textContent.length < 500) {
+  // 構造を数階層遡り、名前や時刻を含む親コンテナを探す（長文やx5に対応するため、3000文字かつ4階層まで拡張）
+  for (let i = 0; i < 4; i++) {
+    if (signatureNode.parentElement && signatureNode.parentElement.textContent.length < 3000) {
       signatureNode = signatureNode.parentElement;
-      signature = signatureNode.textContent || "";
     } else {
-      break; // コンテナが巨大すぎる（親要素が全体リストなど）場合はストップ
+      break;
     }
   }
-  return signature.trim();
+  return signatureNode;
+}
+
+// 親メッセージのDOMコンテナから一意のシグネチャ文字列を取得する
+function getMessageSignature(leafNode) {
+  return getMessageSignatureNode(leafNode).textContent.trim();
 }
 
 /**
@@ -292,6 +305,9 @@ function processIndividualMessages(rootNode, domSignatureCounts) {
     }
   }
 
+  // このバッチ内で処理したシグネチャを追跡し、同一メッセージ内の複数リーフによる多重処理を防ぐ
+  const uniqueSignatures = new Set();
+
   // 見つかった個々のメッセージに対して処理を実行
   for (const leaf of leafMessages) {
     if (processedNodes.has(leaf)) {
@@ -300,6 +316,10 @@ function processIndividualMessages(rootNode, domSignatureCounts) {
     processedNodes.add(leaf);
 
     const signature = getMessageSignature(leaf);
+    if (uniqueSignatures.has(signature)) {
+      continue; // 同一メッセージは1バッチ内で1度だけ処理する
+    }
+    uniqueSignatures.add(signature);
 
     const currentDOMCount = domSignatureCounts.get(signature) || 0;
     const processedCount = processedSignatureCounts.get(signature) || 0;
@@ -319,15 +339,15 @@ function processIndividualMessages(rootNode, domSignatureCounts) {
     let matchedAny = false;
 
     for (const rollText of rolls) {
-      const action = parseDiceResult(rollText);
-      if (!action) continue;
+      const actions = parseDiceResult(rollText);
+      for (const action of actions) {
+        const command = determineCommand(action);
+        if (!command) continue;
 
-      const command = determineCommand(action);
-      if (!command) continue;
-
-      console.log(`[Ccfolia SW2.5 Helper] Detected event:`, action, `-> Queueing: ${command}`);
-      queueChatMessage(command);
-      matchedAny = true;
+        console.log(`[Ccfolia SW2.5 Helper] Detected event:`, action, `-> Queueing: ${command}`);
+        queueChatMessage(command);
+        matchedAny = true;
+      }
     }
 
     if (matchedAny) {
@@ -399,11 +419,13 @@ function startChatObserver() {
     processingTimeout = setTimeout(() => {
       if (pendingNodes.length === 0) return;
 
-      // 1. DOM全体をスキャンし、各シグネチャの現在の出現回数をマップ化
+      // 1. DOM全体をスキャンし、各シグネチャの現在の出現回数をマップ化（重複排除付き）
       const domSignatureCounts = new Map();
       const currentContainer = findChatContainer();
       if (currentContainer) {
         const els = currentContainer.querySelectorAll('*');
+        const countedNodes = new Set(); // 同一メッセージノードが二重カウントされるのを防ぐ
+
         for (const el of els) {
           const text = el.textContent || "";
           if (text.includes('＞') || text.includes('>')) {
@@ -416,8 +438,12 @@ function startChatObserver() {
               }
             }
             if (!childHasMarker) {
-              const sig = getMessageSignature(el);
-              domSignatureCounts.set(sig, (domSignatureCounts.get(sig) || 0) + 1);
+              const sigNode = getMessageSignatureNode(el);
+              if (!countedNodes.has(sigNode)) {
+                countedNodes.add(sigNode);
+                const sig = sigNode.textContent.trim();
+                domSignatureCounts.set(sig, (domSignatureCounts.get(sig) || 0) + 1);
+              }
             }
           }
         }
