@@ -36,27 +36,33 @@ const state = {
  * Filters out elements that have children also containing the markers.
  */
 function extractLeafMessages(rootNode) {
-  if (!rootNode) return [];
-  const allElements = [rootNode, ...Array.from(rootNode.querySelectorAll('*'))];
-  const leafMessages = [];
+  if (!rootNode || typeof rootNode.querySelectorAll !== 'function') return [];
+  
+  try {
+    const allElements = [rootNode, ...Array.from(rootNode.querySelectorAll('*'))];
+    const leafMessages = [];
 
-  for (const el of allElements) {
-    const text = el.textContent || "";
-    if (text.includes('＞') || text.includes('>')) {
-      let childHasMarker = false;
-      for (const child of el.children) {
-        const childText = child.textContent || "";
-        if (childText.includes('＞') || childText.includes('>')) {
-          childHasMarker = true;
-          break;
+    for (const el of allElements) {
+      const text = el.textContent || "";
+      if (text.includes('＞') || text.includes('>')) {
+        let childHasMarker = false;
+        for (const child of el.children) {
+          const childText = child.textContent || "";
+          if (childText.includes('＞') || childText.includes('>')) {
+            childHasMarker = true;
+            break;
+          }
+        }
+        if (!childHasMarker) {
+          leafMessages.push(el);
         }
       }
-      if (!childHasMarker) {
-        leafMessages.push(el);
-      }
     }
+    return leafMessages;
+  } catch (e) {
+    console.error("[Ccfolia SW2.5 Helper] Error extracting leaf messages:", e);
+    return [];
   }
-  return leafMessages;
 }
 
 /**
@@ -72,12 +78,17 @@ function processCommandQueue() {
   state.isProcessingQueue = true;
   
   const command = state.commandQueue.shift();
-  sendChatMessage(command);
-  
-  setTimeout(() => {
-    state.isProcessingQueue = false;
-    processCommandQueue();
-  }, CONFIG.COMMAND_DELAY);
+  try {
+    sendChatMessage(command);
+  } catch (e) {
+    console.error("[Ccfolia SW2.5 Helper] Exception caught in sendChatMessage:", e);
+  } finally {
+    // Ensure the queue is never locked up by using finally block
+    setTimeout(() => {
+      state.isProcessingQueue = false;
+      processCommandQueue();
+    }, CONFIG.COMMAND_DELAY);
+  }
 }
 
 /**
@@ -132,46 +143,56 @@ document.addEventListener('visibilitychange', () => {
  * Locate the chat textarea among multiple textareas
  */
 function getChatTextarea() {
-  const textareas = document.querySelectorAll('textarea');
-  if (textareas.length === 0) return null;
-  if (textareas.length === 1) return textareas[0];
+  try {
+    const textareas = document.querySelectorAll('textarea');
+    if (textareas.length === 0) return null;
+    if (textareas.length === 1) return textareas[0];
 
-  // 1. Check placeholder keywords (prevent matching character sheets)
-  for (const ta of textareas) {
-    const ph = ta.placeholder || "";
-    if (CONFIG.CHAT_TEXTAREA_KEYWORDS.some(kw => ph.includes(kw))) {
-      return ta;
-    }
-  }
-
-  // 2. Proximity search: find textarea near a button
-  for (const ta of textareas) {
-    let parent = ta.parentElement;
-    for (let i = 0; i < CONFIG.MAX_TEXTAREA_SEARCH_DEPTH && parent; i++) {
-      const buttons = parent.querySelectorAll('button');
-      if (buttons.length > 0) {
+    // 1. Check placeholder keywords (prevent matching character sheets)
+    for (const ta of textareas) {
+      const ph = ta.placeholder || "";
+      if (CONFIG.CHAT_TEXTAREA_KEYWORDS.some(kw => ph.includes(kw))) {
         return ta;
       }
-      parent = parent.parentElement;
     }
+
+    // 2. Proximity search: find textarea near a button
+    for (const ta of textareas) {
+      let parent = ta.parentElement;
+      for (let i = 0; i < CONFIG.MAX_TEXTAREA_SEARCH_DEPTH && parent; i++) {
+        const buttons = parent.querySelectorAll('button');
+        if (buttons.length > 0) {
+          return ta;
+        }
+        parent = parent.parentElement;
+      }
+    }
+    
+    // 3. Fallback to the last textarea
+    return textareas[textareas.length - 1];
+  } catch (e) {
+    console.error("[Ccfolia SW2.5 Helper] Error getting chat textarea:", e);
+    return null;
   }
-  
-  // 3. Fallback to the last textarea
-  return textareas[textareas.length - 1];
 }
 
 /**
  * Find the chat container dynamically by climbing up from textarea
  */
 function findChatContainer() {
-  const textarea = getChatTextarea();
-  if (!textarea) return null;
+  try {
+    const textarea = getChatTextarea();
+    if (!textarea) return null;
 
-  let container = textarea;
-  for (let i = 0; i < CONFIG.MAX_DOM_SEARCH_DEPTH && container.parentElement; i++) {
-    container = container.parentElement;
+    let container = textarea;
+    for (let i = 0; i < CONFIG.MAX_DOM_SEARCH_DEPTH && container.parentElement; i++) {
+      container = container.parentElement;
+    }
+    return container;
+  } catch (e) {
+    console.error("[Ccfolia SW2.5 Helper] Error finding chat container:", e);
+    return null;
   }
-  return container;
 }
 
 /**
@@ -252,33 +273,37 @@ function sendChatMessage(command) {
   textarea.dispatchEvent(new Event('change', { bubbles: true }));
 
   setTimeout(() => {
-    // 1. Dispatch full sequence of keyboard events for Enter key
-    const eventParams = {
-      key: 'Enter',
-      code: 'Enter',
-      keyCode: 13,
-      which: 13,
-      bubbles: true,
-      cancelable: true
-    };
-    textarea.dispatchEvent(new KeyboardEvent('keydown', eventParams));
-    textarea.dispatchEvent(new KeyboardEvent('keypress', eventParams));
-    textarea.dispatchEvent(new KeyboardEvent('keyup', eventParams));
+    try {
+      // 1. Dispatch full sequence of keyboard events for Enter key
+      const eventParams = {
+        key: 'Enter',
+        code: 'Enter',
+        keyCode: 13,
+        which: 13,
+        bubbles: true,
+        cancelable: true
+      };
+      textarea.dispatchEvent(new KeyboardEvent('keydown', eventParams));
+      textarea.dispatchEvent(new KeyboardEvent('keypress', eventParams));
+      textarea.dispatchEvent(new KeyboardEvent('keyup', eventParams));
 
-    // 2. Proximity search fallback: find and click the send button
-    let sendButton = null;
-    let parent = textarea.parentElement;
-    for (let i = 0; i < CONFIG.MAX_TEXTAREA_SEARCH_DEPTH && parent; i++) {
-      const buttons = parent.querySelectorAll('button');
-      if (buttons.length > 0) {
-        sendButton = buttons[buttons.length - 1];
-        break;
+      // 2. Proximity search fallback: find and click the send button
+      let sendButton = null;
+      let parent = textarea.parentElement;
+      for (let i = 0; i < CONFIG.MAX_TEXTAREA_SEARCH_DEPTH && parent; i++) {
+        const buttons = parent.querySelectorAll('button');
+        if (buttons.length > 0) {
+          sendButton = buttons[buttons.length - 1];
+          break;
+        }
+        parent = parent.parentElement;
       }
-      parent = parent.parentElement;
-    }
 
-    if (sendButton) {
-      sendButton.click();
+      if (sendButton) {
+        sendButton.click();
+      }
+    } catch (e) {
+      console.error("[Ccfolia SW2.5 Helper] Error triggering Enter/Click:", e);
     }
   }, CONFIG.REACT_TRIGGER_DELAY);
 }
@@ -414,72 +439,89 @@ function processIndividualMessages(rootNode, domSignatureCounts) {
  * Initialize and start the MutationObserver on the chat container.
  */
 function startChatObserver() {
-  const container = findChatContainer();
-  if (!container) {
-    setTimeout(startChatObserver, 1000);
-    return;
-  }
-
-  state.observedContainer = container;
-  console.log('[Ccfolia SW2.5 Helper] Observer initialized. Monitoring chat updates...');
-
-  // Reset tracking lists on start
-  state.processedSignatureCounts.clear();
-  state.processedSignaturesQueue.length = 0;
-
-  // Mark all existing messages as processed initially
-  const leafMessages = extractLeafMessages(container);
-  for (const leaf of leafMessages) {
-    state.processedNodes.add(leaf);
-    const signature = getMessageSignature(leaf);
-    markProcessed(signature);
-  }
-
-  let pendingNodes = [];
-  let processingTimeout = null;
-
-  state.chatObserver = new MutationObserver((mutations) => {
-    for (const mutation of mutations) {
-      if (mutation.type === 'childList') {
-        for (const node of mutation.addedNodes) {
-          if (node.nodeType === Node.ELEMENT_NODE) {
-            pendingNodes.push(node);
-          }
-        }
-      }
+  try {
+    const container = findChatContainer();
+    if (!container) {
+      setTimeout(startChatObserver, 1000);
+      return;
     }
 
-    // Debounce processing to handle rapid consecutive node additions
-    clearTimeout(processingTimeout);
-    processingTimeout = setTimeout(() => {
-      if (pendingNodes.length === 0) return;
+    state.observedContainer = container;
+    console.log('[Ccfolia SW2.5 Helper] Observer initialized. Monitoring chat updates...');
 
-      const currentContainer = findChatContainer();
-      const domSignatureCounts = countDOMSignatures(currentContainer);
+    // Reset tracking lists on start
+    state.processedSignatureCounts.clear();
+    state.processedSignaturesQueue.length = 0;
 
-      // Clean up old signatures no longer present on DOM
-      gcProcessedSignatures(domSignatureCounts);
+    // Mark all existing messages as processed initially
+    const leafMessages = extractLeafMessages(container);
+    for (const leaf of leafMessages) {
+      state.processedNodes.add(leaf);
+      const signature = getMessageSignature(leaf);
+      markProcessed(signature);
+    }
 
-      // Handle massive updates silently (e.g. room load or channel switch)
-      if (pendingNodes.length > CONFIG.BULK_RENDER_THRESHOLD) {
-        console.log(`[Ccfolia SW2.5 Helper] Bulk render detected (${pendingNodes.length} nodes). Syncing count silently.`);
-        syncNodesSilently(pendingNodes);
-        pendingNodes = [];
-        return;
+    let pendingNodes = [];
+    let processingTimeout = null;
+
+    state.chatObserver = new MutationObserver((mutations) => {
+      try {
+        for (const mutation of mutations) {
+          if (mutation.type === 'childList') {
+            for (const node of mutation.addedNodes) {
+              if (node.nodeType === Node.ELEMENT_NODE) {
+                pendingNodes.push(node);
+              }
+            }
+          }
+        }
+
+        // Debounce processing to handle rapid consecutive node additions
+        clearTimeout(processingTimeout);
+        processingTimeout = setTimeout(() => {
+          if (pendingNodes.length === 0) return;
+
+          try {
+            const currentContainer = findChatContainer();
+            const domSignatureCounts = countDOMSignatures(currentContainer);
+
+            // Clean up old signatures no longer present on DOM
+            gcProcessedSignatures(domSignatureCounts);
+
+            // Handle massive updates silently (e.g. room load or channel switch)
+            if (pendingNodes.length > CONFIG.BULK_RENDER_THRESHOLD) {
+              console.log(`[Ccfolia SW2.5 Helper] Bulk render detected (${pendingNodes.length} nodes). Syncing count silently.`);
+              syncNodesSilently(pendingNodes);
+              pendingNodes = [];
+              return;
+            }
+
+            // Process newly added nodes
+            for (const node of pendingNodes) {
+              try {
+                processIndividualMessages(node, domSignatureCounts);
+              } catch (e) {
+                console.error("[Ccfolia SW2.5 Helper] Error in processIndividualMessages:", e);
+              }
+            }
+          } catch (e) {
+            console.error("[Ccfolia SW2.5 Helper] Error in debounced observer runner:", e);
+          } finally {
+            pendingNodes = [];
+          }
+        }, 50);
+      } catch (e) {
+        console.error("[Ccfolia SW2.5 Helper] Error in MutationObserver callback:", e);
       }
+    });
 
-      // Process newly added nodes
-      for (const node of pendingNodes) {
-        processIndividualMessages(node, domSignatureCounts);
-      }
-      pendingNodes = [];
-    }, 50);
-  });
-
-  state.chatObserver.observe(container, {
-    childList: true,
-    subtree: true
-  });
+    state.chatObserver.observe(container, {
+      childList: true,
+      subtree: true
+    });
+  } catch (e) {
+    console.error("[Ccfolia SW2.5 Helper] Error in startChatObserver:", e);
+  }
 }
 
 // Initial entry point
@@ -491,12 +533,16 @@ if (document.readyState === 'loading') {
 
 // Re-initialization recovery for SPAs
 setInterval(() => {
-  const currentContainer = findChatContainer();
-  if (state.chatObserver && (!document.body.contains(state.observedContainer) || currentContainer !== state.observedContainer)) {
-    console.log('[Ccfolia SW2.5 Helper] Chat container detached or changed. Re-initializing...');
-    state.chatObserver.disconnect();
-    state.chatObserver = null;
-    state.observedContainer = null;
-    startChatObserver();
+  try {
+    const currentContainer = findChatContainer();
+    if (state.chatObserver && (!document.body.contains(state.observedContainer) || currentContainer !== state.observedContainer)) {
+      console.log('[Ccfolia SW2.5 Helper] Chat container detached or changed. Re-initializing...');
+      state.chatObserver.disconnect();
+      state.chatObserver = null;
+      state.observedContainer = null;
+      startChatObserver();
+    }
+  } catch (e) {
+    console.error("[Ccfolia SW2.5 Helper] Error in observer check interval:", e);
   }
 }, CONFIG.OBSERVER_RECONNECT_INTERVAL);
