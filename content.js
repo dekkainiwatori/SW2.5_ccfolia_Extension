@@ -52,11 +52,34 @@ document.addEventListener('visibilitychange', () => {
 });
 
 /**
+ * 複数のtextareaが存在する中から、チャット入力用のものを特定する。
+ * 送信ボタンが近くにあるものをチャット入力欄と判断します。
+ */
+function getChatTextarea() {
+  const textareas = document.querySelectorAll('textarea');
+  if (textareas.length === 0) return null;
+  if (textareas.length === 1) return textareas[0];
+
+  for (const ta of textareas) {
+    let parent = ta.parentElement;
+    for (let i = 0; i < 5 && parent; i++) {
+      const buttons = parent.querySelectorAll('button');
+      if (buttons.length > 0) {
+        return ta;
+      }
+      parent = parent.parentElement;
+    }
+  }
+  // 見つからない場合は一番最後の要素をフォールバックとする
+  return textareas[textareas.length - 1];
+}
+
+/**
  * 1. Find the chat container element dynamically.
  * パフォーマンス向上のため、body全体ではなく、チャット入力欄(textarea)の周辺コンテナを監視対象とします。
  */
 function findChatContainer() {
-  const textarea = document.querySelector('textarea');
+  const textarea = getChatTextarea();
   if (!textarea) {
     return null;
   }
@@ -94,13 +117,13 @@ function parseDiceResult(text) {
   // 1. Skill Check: Exclude monster damage marked by [D]
   const isSkillCheck = text.includes('(2D6') && !text.includes('[D]');
 
-  // 2. Detect Skill Check Fumble (1,1)
-  if (isSkillCheck && text.includes('2[1,1]')) {
+  // 2. Detect Skill Check Fumble (1,1) - 修正値対応として [1,1] や "自動失敗" を検知
+  if (isSkillCheck && (text.includes('[1,1]') || text.includes('自動失敗'))) {
     return { type: 'skill_fumble', rotations: 0 };
   }
 
-  // 3. Detect Skill Check Critical (6,6)
-  if (isSkillCheck && text.includes('12[6,6]')) {
+  // 3. Detect Skill Check Critical (6,6) - 修正値対応として [6,6] や "自動成功" を検知
+  if (isSkillCheck && (text.includes('[6,6]') || text.includes('自動成功'))) {
     return { type: 'skill_critical', rotations: 0 };
   }
 
@@ -137,7 +160,7 @@ function determineCommand(action) {
  * 4. Input and send a message via React-controlled textarea.
  */
 function sendChatMessage(command) {
-  const textarea = document.querySelector('textarea');
+  const textarea = getChatTextarea();
   if (!textarea) {
     console.error('[Ccfolia SW2.5 Helper] Textarea not found!');
     return;
