@@ -6,14 +6,14 @@
 const CONFIG = {
   COMMAND_DELAY: 500,                  // Delay between sending queued messages (ms)
   REACT_TRIGGER_DELAY: 100,            // Delay before triggering Enter/click (ms)
-  TAB_FOCUS_IGNORE_DURATION: 1500,     // Ignore messages duration after tab visibility changes (ms)
+  TAB_FOCUS_IGNORE_DURATION: 500,      // Ignore messages duration after tab visibility changes (ms)
   OBSERVER_RECONNECT_INTERVAL: 3000,   // Interval to check for detached/changed chat container (ms)
   MAX_SIGNATURE_QUEUE_SIZE: 1000,      // Max size of processed signatures queue
   MAX_TEXT_CONTENT_LENGTH: 3000,       // Max text length for message signature container
   MAX_DOM_SEARCH_DEPTH: 8,             // Search depth to find the chat container
-  MAX_SIGNATURE_SEARCH_DEPTH: 4,       // Search depth to find signature node
+  MAX_SIGNATURE_SEARCH_DEPTH: 2,       // Search depth to find signature node
   MAX_TEXTAREA_SEARCH_DEPTH: 5,        // Search depth for button/textarea proximity search
-  BULK_RENDER_THRESHOLD: 5,            // Threshold of nodes to trigger silent sync (skip sending commands)
+  BULK_RENDER_THRESHOLD: 40,            // Threshold of nodes to trigger silent sync (skip sending commands)
   CHAT_TEXTAREA_KEYWORDS: ['送信', 'チャット', 'Enter', 'メッセージ']
 };
 
@@ -313,13 +313,29 @@ function sendChatMessage(command) {
  */
 function getMessageSignatureNode(leafNode) {
   let signatureNode = leafNode;
-  for (let i = 0; i < CONFIG.MAX_SIGNATURE_SEARCH_DEPTH; i++) {
-    if (signatureNode.parentElement && signatureNode.parentElement.textContent.length < CONFIG.MAX_TEXT_CONTENT_LENGTH) {
-      signatureNode = signatureNode.parentElement;
-    } else {
-      break;
+  
+  for (let i = 0; i < 12; i++) {
+    const parent = signatureNode.parentElement;
+    if (!parent) break;
+    
+    // Stop if parent is the chat list container
+    if (parent.className && typeof parent.className === 'string' && parent.className.includes('MuiList-root')) {
+      return signatureNode;
+    }
+    
+    // Stop if parent text is too long (heuristic for chat list container)
+    if (parent.textContent.length >= 1500) {
+      return signatureNode;
+    }
+
+    signatureNode = parent;
+    
+    // Stop if we found the message container
+    if (signatureNode.className && typeof signatureNode.className === 'string' && signatureNode.className.includes('MuiListItem-root')) {
+      return signatureNode;
     }
   }
+  
   return signatureNode;
 }
 
@@ -390,9 +406,16 @@ function processIndividualMessages(rootNode, domSignatureCounts) {
     state.isTabJustFocused = false;
   }
   
-  if (document.hidden || state.isTabJustFocused) return;
+  if (document.hidden || state.isTabJustFocused) {
+    // [DEBUG] タブフォーカス直後の誤爆防止期間によるスキップ
+    // if (state.isTabJustFocused) console.log("[Ccfolia SW2.5 Helper] Skipped: Tab focus grace period active.");
+    return;
+  }
 
   const leafMessages = extractLeafMessages(rootNode);
+  // [DEBUG] 取得したメッセージ内で「＞」を含むテキストノードの数
+  // if (leafMessages.length > 0) console.log(`[Ccfolia SW2.5 Helper] Found ${leafMessages.length} leaf message(s) containing dice marker.`);
+
   const uniqueSignatures = new Set();
 
   for (const leaf of leafMessages) {
@@ -400,17 +423,25 @@ function processIndividualMessages(rootNode, domSignatureCounts) {
     state.processedNodes.add(leaf);
 
     const signature = getMessageSignature(leaf);
-    if (uniqueSignatures.has(signature)) continue;
+    // [DEBUG] メッセージ全体から抽出されたテキスト（シグネチャ）の確認
+    // console.log(`[Ccfolia SW2.5 Helper] Target signature: "${signature}"`);
+
+    if (uniqueSignatures.has(signature)) {
+      // [DEBUG] 同一バッチ内で重複したシグネチャのスキップ
+      // console.log(`[Ccfolia SW2.5 Helper] Skipped: Duplicate signature in current DOM mutation batch.`);
+      continue;
+    }
     uniqueSignatures.add(signature);
 
     const currentDOMCount = domSignatureCounts.get(signature) || 0;
     const processedCount = state.processedSignatureCounts.get(signature) || 0;
+    
+    // [DEBUG] DOM上の出現回数と処理済み回数の比較（未処理判定のコアロジック）
+    // console.log(`[Ccfolia SW2.5 Helper] Count check - DOM: ${currentDOMCount}, Processed: ${processedCount}`);
 
-    if (currentDOMCount <= processedCount) continue;
-
-    // Avoid self-trigger loops: skip messages containing auto-injected commands
-    if (signature.includes('@クリティカル') || signature.includes('@ファンブル') || signature.includes('@自動成功') || signature.includes('@自動失敗')) {
-      markProcessed(signature);
+    if (currentDOMCount <= processedCount) {
+      // [DEBUG] 既に処理済みのメッセージとしてのスキップ
+      // console.log(`[Ccfolia SW2.5 Helper] Skipped: Signature already processed.`);
       continue;
     }
 
@@ -419,11 +450,15 @@ function processIndividualMessages(rootNode, domSignatureCounts) {
 
     for (const rollText of rolls) {
       const actions = parseDiceResult(rollText);
+      // [DEBUG] メッセージから抽出された全アクション（回転、自動成功など）
+      // if (actions.length > 0) console.log(`[Ccfolia SW2.5 Helper] Parsed actions from "${rollText}":`, actions);
+      
       for (const action of actions) {
         const command = determineCommand(action);
         if (!command) continue;
 
-        console.log(`[Ccfolia SW2.5 Helper] Detected event:`, action, `-> Queueing: ${command}`);
+        // [DEBUG] 送信キューにカットインコマンドが登録される際のアクション
+        // console.log(`[Ccfolia SW2.5 Helper] Detected event:`, action, `-> Queueing: ${command}`);
         queueChatMessage(command);
         matchedAny = true;
       }
@@ -490,7 +525,8 @@ function startChatObserver() {
 
             // Handle massive updates silently (e.g. room load or channel switch)
             if (pendingNodes.length > CONFIG.BULK_RENDER_THRESHOLD) {
-              console.log(`[Ccfolia SW2.5 Helper] Bulk render detected (${pendingNodes.length} nodes). Syncing count silently.`);
+              // [DEBUG] 大量ノード追加時の一括スキップ処理ログ
+              // console.log(`[Ccfolia SW2.5 Helper] Bulk render detected (${pendingNodes.length} nodes). Syncing count silently.`);
               syncNodesSilently(pendingNodes);
               pendingNodes = [];
               return;
