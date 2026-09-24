@@ -1,69 +1,41 @@
 /**
  * Ccfolia SW2.5 Dice Cut-in Helper Content Script
+ *
+ * 検知の方針:
+ *   ココフォリアのチャット欄は仮想リスト（表示範囲の行だけDOMに存在）で、
+ *   チャットタブ切り替えやスクロールのたびに同じメッセージの行が作り直される。
+ *   そのためDOMの追加やテキストでは「新着」を判定できない。
+ *   各行のReactコンポーネントが持つメッセージオブジェクト（_id / createdAt / extend.roll）を読み、
+ *     - _id で一度処理したメッセージは二度と処理しない
+ *     - createdAt が「これまでに見た最新時刻」より新しく、かつ直近 FRESH_WINDOW 以内のものだけを新着とみなす
+ *   ことで、再描画による再発火と読み込み時の誤発火を防ぐ。
+ *   React内部を読むため、manifest で world: "MAIN" として実行する。
  */
 
 // Configuration constants
 const CONFIG = {
   COMMAND_DELAY: 500,                  // Delay between sending queued messages (ms)
   REACT_TRIGGER_DELAY: 100,            // Delay before triggering Enter/click (ms)
-  TAB_FOCUS_IGNORE_DURATION: 500,      // Ignore messages duration after tab visibility changes (ms)
-  OBSERVER_RECONNECT_INTERVAL: 3000,   // Interval to check for detached/changed chat container (ms)
-  MAX_SIGNATURE_QUEUE_SIZE: 1000,      // Max size of processed signatures queue
-  MAX_TEXT_CONTENT_LENGTH: 3000,       // Max text length for message signature container
-  MAX_DOM_SEARCH_DEPTH: 8,             // Search depth to find the chat container
-  MAX_SIGNATURE_SEARCH_DEPTH: 2,       // Search depth to find signature node
+  SCAN_THROTTLE: 100,                  // Min interval between DOM scans (ms)
+  FRESH_WINDOW: 30000,                 // Only messages created within this window are fired (ms). Prevents late cut-ins
+                                       // for messages first rendered later (other chat tab, background browser tab)
+  MAX_SEEN_IDS: 5000,                  // Max number of message ids to remember
+  MAX_FIBER_CLIMB: 10,                 // Fiber levels to climb from a row to the message component
   MAX_TEXTAREA_SEARCH_DEPTH: 5,        // Search depth for button/textarea proximity search
-  BULK_RENDER_THRESHOLD: 40,            // Threshold of nodes to trigger silent sync (skip sending commands)
+  CHAT_ROW_SELECTOR: 'ul[role="log"] [data-index]',
   CHAT_TEXTAREA_KEYWORDS: ['送信', 'チャット', 'Enter', 'メッセージ']
 };
 
+const LOG_PREFIX = '[Ccfolia SW2.5 Helper]';
+
 // Global state
 const state = {
-  chatObserver: null,
-  observedContainer: null,
   commandQueue: [],
   isProcessingQueue: false,
-  isTabJustFocused: false,
-  tabFocusTimeout: null,
-  lastVisibleTime: Date.now(),
-  processedSignatureCounts: new Map(),
-  processedSignaturesQueue: [],
-  processedNodes: new WeakSet()
+  seenIds: new Set(),        // Message ids already handled (insertion ordered)
+  highWater: null,           // Newest createdAt (ms) observed so far; null until the first scan
+  warnedNoMessage: false
 };
-
-/**
- * Extract leaf elements (minimum message units) containing SW2.5 dice markers.
- * Filters out elements that have children also containing the markers.
- */
-function extractLeafMessages(rootNode) {
-  if (!rootNode || typeof rootNode.querySelectorAll !== 'function') return [];
-  
-  try {
-    const allElements = [rootNode, ...Array.from(rootNode.querySelectorAll('*'))];
-    const leafMessages = [];
-
-    for (const el of allElements) {
-      const text = el.textContent || "";
-      if (text.includes('＞') || text.includes('>')) {
-        let childHasMarker = false;
-        for (const child of el.children) {
-          const childText = child.textContent || "";
-          if (childText.includes('＞') || childText.includes('>')) {
-            childHasMarker = true;
-            break;
-          }
-        }
-        if (!childHasMarker) {
-          leafMessages.push(el);
-        }
-      }
-    }
-    return leafMessages;
-  } catch (e) {
-    console.error("[Ccfolia SW2.5 Helper] Error extracting leaf messages:", e);
-    return [];
-  }
-}
 
 /**
  * Queue a chat command to prevent message collisions
@@ -76,12 +48,12 @@ function queueChatMessage(command) {
 function processCommandQueue() {
   if (state.isProcessingQueue || state.commandQueue.length === 0) return;
   state.isProcessingQueue = true;
-  
+
   const command = state.commandQueue.shift();
   try {
     sendChatMessage(command);
   } catch (e) {
-    console.error("[Ccfolia SW2.5 Helper] Exception caught in sendChatMessage:", e);
+    console.error(`${LOG_PREFIX} Exception caught in sendChatMessage:`, e);
   } finally {
     // Ensure the queue is never locked up by using finally block
     setTimeout(() => {
@@ -100,44 +72,6 @@ function splitMultiRolls(text) {
   }
   return [text];
 }
-
-/**
- * Mark a signature as processed, managing the queue size
- */
-function markProcessed(signature) {
-  if (!signature) return;
-  const sig = signature.trim();
-  if (!sig) return;
-  
-  const currentCount = state.processedSignatureCounts.get(sig) || 0;
-  state.processedSignatureCounts.set(sig, currentCount + 1);
-  
-  state.processedSignaturesQueue.push(sig);
-  if (state.processedSignaturesQueue.length > CONFIG.MAX_SIGNATURE_QUEUE_SIZE) {
-    const oldest = state.processedSignaturesQueue.shift();
-    const count = state.processedSignatureCounts.get(oldest) || 0;
-    if (count <= 1) {
-      state.processedSignatureCounts.delete(oldest);
-    } else {
-      state.processedSignatureCounts.set(oldest, count - 1);
-    }
-  }
-}
-
-// Track tab visibility changes
-document.addEventListener('visibilitychange', () => {
-  clearTimeout(state.tabFocusTimeout);
-  if (document.hidden) {
-    state.isTabJustFocused = true;
-  } else {
-    state.isTabJustFocused = true;
-    state.lastVisibleTime = Date.now();
-    // Ignore messages for a brief period after tab becomes visible
-    state.tabFocusTimeout = setTimeout(() => {
-      state.isTabJustFocused = false;
-    }, CONFIG.TAB_FOCUS_IGNORE_DURATION);
-  }
-});
 
 /**
  * Locate the chat textarea among multiple textareas
@@ -167,30 +101,11 @@ function getChatTextarea() {
         parent = parent.parentElement;
       }
     }
-    
+
     // 3. Fallback to the last textarea
     return textareas[textareas.length - 1];
   } catch (e) {
-    console.error("[Ccfolia SW2.5 Helper] Error getting chat textarea:", e);
-    return null;
-  }
-}
-
-/**
- * Find the chat container dynamically by climbing up from textarea
- */
-function findChatContainer() {
-  try {
-    const textarea = getChatTextarea();
-    if (!textarea) return null;
-
-    let container = textarea;
-    for (let i = 0; i < CONFIG.MAX_DOM_SEARCH_DEPTH && container.parentElement; i++) {
-      container = container.parentElement;
-    }
-    return container;
-  } catch (e) {
-    console.error("[Ccfolia SW2.5 Helper] Error finding chat container:", e);
+    console.error(`${LOG_PREFIX} Error getting chat textarea:`, e);
     return null;
   }
 }
@@ -255,7 +170,7 @@ function determineCommand(action) {
 function sendChatMessage(command) {
   const textarea = getChatTextarea();
   if (!textarea) {
-    console.error('[Ccfolia SW2.5 Helper] Textarea not found!');
+    console.error(`${LOG_PREFIX} Textarea not found!`);
     return;
   }
 
@@ -303,282 +218,172 @@ function sendChatMessage(command) {
         sendButton.click();
       }
     } catch (e) {
-      console.error("[Ccfolia SW2.5 Helper] Error triggering Enter/Click:", e);
+      console.error(`${LOG_PREFIX} Error triggering Enter/Click:`, e);
     }
   }, CONFIG.REACT_TRIGGER_DELAY);
 }
 
 /**
- * Traverse DOM up to locate signature container (containing character name/time)
+ * Get the React fiber attached to a DOM element
  */
-function getMessageSignatureNode(leafNode) {
-  let signatureNode = leafNode;
-  
-  for (let i = 0; i < 12; i++) {
-    const parent = signatureNode.parentElement;
-    if (!parent) break;
-    
-    // Stop if parent is the chat list container
-    if (parent.className && typeof parent.className === 'string' && parent.className.includes('MuiList-root')) {
-      return signatureNode;
-    }
-    
-    // Stop if parent text is too long (heuristic for chat list container)
-    if (parent.textContent.length >= 1500) {
-      return signatureNode;
-    }
-
-    signatureNode = parent;
-    
-    // Stop if we found the message container
-    if (signatureNode.className && typeof signatureNode.className === 'string' && signatureNode.className.includes('MuiListItem-root')) {
-      return signatureNode;
-    }
+function getFiber(el) {
+  for (const key in el) {
+    if (key.startsWith('__reactFiber$')) return el[key];
   }
-  
-  return signatureNode;
+  return null;
 }
 
 /**
- * Retrieve unique signature string of a message node
+ * Find the Ccfolia message object ({ _id, createdAt, extend, ... }) rendered in a chat row.
+ * Climbs from the row's fiber to the component that receives `messageId`,
+ * then looks through its hook states for the object whose _id matches.
  */
-function getMessageSignature(leafNode) {
-  return getMessageSignatureNode(leafNode).textContent.trim();
-}
-
-/**
- * Map current occurrences of all chat signatures on DOM
- */
-function countDOMSignatures(container) {
-  const domSignatureCounts = new Map();
-  if (!container) return domSignatureCounts;
-
-  const leafMessages = extractLeafMessages(container);
-  const countedNodes = new Set();
-
-  for (const leaf of leafMessages) {
-    const sigNode = getMessageSignatureNode(leaf);
-    if (!countedNodes.has(sigNode)) {
-      countedNodes.add(sigNode);
-      const sig = sigNode.textContent.trim();
-      domSignatureCounts.set(sig, (domSignatureCounts.get(sig) || 0) + 1);
+function getMessageFromRow(row) {
+  const inner = row.firstElementChild || row;
+  let fiber = getFiber(inner);
+  for (let i = 0; i < CONFIG.MAX_FIBER_CLIMB && fiber; i++) {
+    const props = fiber.memoizedProps;
+    if (props && typeof props.messageId === 'string') {
+      return findMessageInHooks(fiber, props.messageId);
     }
+    fiber = fiber.return;
   }
-  return domSignatureCounts;
+  return null;
+}
+
+function findMessageInHooks(fiber, messageId) {
+  const isTarget = (v) => v && typeof v === 'object' && v._id === messageId;
+  let hook = fiber.memoizedState;
+  for (let i = 0; i < 100 && hook; i++) {
+    const v = hook.memoizedState;
+    if (isTarget(v)) return v;
+    if (v && typeof v === 'object') {
+      if (isTarget(v.current)) return v.current;
+      if (v.current && isTarget(v.current.value)) return v.current.value;
+    }
+    hook = hook.next;
+  }
+  return null;
 }
 
 /**
- * Clean up state signatures that no longer exist on DOM (garbage collection)
+ * createdAt (Firestore Timestamp / number / null) to milliseconds.
+ * Returns null while the server timestamp is still pending (own message just sent).
  */
-function gcProcessedSignatures(domSignatureCounts) {
-  for (const [sig, processedCount] of state.processedSignatureCounts.entries()) {
-    const domCount = domSignatureCounts.get(sig) || 0;
-    if (domCount < processedCount) {
-      if (domCount === 0) {
-        state.processedSignatureCounts.delete(sig);
-      } else {
-        state.processedSignatureCounts.set(sig, domCount);
-      }
-    }
+function toMillis(ts) {
+  if (!ts) return null;
+  if (typeof ts === 'number') return ts;
+  if (typeof ts.toMillis === 'function') return ts.toMillis();
+  if (typeof ts.seconds === 'number') return ts.seconds * 1000 + Math.floor((ts.nanoseconds || 0) / 1e6);
+  return null;
+}
+
+function rememberId(id) {
+  state.seenIds.add(id);
+  if (state.seenIds.size > CONFIG.MAX_SEEN_IDS) {
+    // Set keeps insertion order: drop the oldest
+    state.seenIds.delete(state.seenIds.values().next().value);
   }
 }
 
 /**
- * Silent sync of new nodes (typically for initial renders or bulk loading)
+ * Handle a newly arrived dice message
  */
-function syncNodesSilently(nodes) {
-  for (const node of nodes) {
-    const leafMessages = extractLeafMessages(node);
-    for (const leaf of leafMessages) {
-      state.processedNodes.add(leaf);
-      const signature = getMessageSignature(leaf);
-      markProcessed(signature);
+function handleNewMessage(message) {
+  const roll = message.extend && message.extend.roll;
+  // Secret dice: firing a cut-in would reveal the result
+  if (!roll || roll.secret || typeof roll.result !== 'string') return;
+
+  for (const rollText of splitMultiRolls(roll.result)) {
+    for (const action of parseDiceResult(rollText)) {
+      const command = determineCommand(action);
+      if (command) queueChatMessage(command);
     }
   }
 }
 
 /**
- * Process a single message node, parse dice results, and queue commands if appropriate
+ * Scan all rendered chat rows and fire only for messages that are genuinely new.
  */
-function processIndividualMessages(rootNode, domSignatureCounts) {
-  // Grace period to recover isTabJustFocused flag
-  if (state.isTabJustFocused && !document.hidden && Date.now() - state.lastVisibleTime > 2000) {
-    state.isTabJustFocused = false;
+function scanChatRows() {
+  const rows = document.querySelectorAll(CONFIG.CHAT_ROW_SELECTOR);
+  if (rows.length === 0) return;
+
+  const isFirstScan = state.highWater === null;
+  const baseline = state.highWater ?? -Infinity;
+  const oldestAllowed = Date.now() - CONFIG.FRESH_WINDOW;
+  let newest = baseline;
+  let foundAny = false;
+  const fresh = [];
+
+  for (const row of rows) {
+    const message = getMessageFromRow(row);
+    if (!message) continue;
+    foundAny = true;
+
+    if (state.seenIds.has(message._id)) continue;
+    rememberId(message._id);
+
+    const createdAt = toMillis(message.createdAt);
+    if (createdAt !== null && createdAt > newest) newest = createdAt;
+
+    if (isFirstScan) continue; // Existing log on load: mark only
+
+    if (createdAt === null) {
+      // Server timestamp still pending = posted from this client just now
+      fresh.push({ message, order: Infinity });
+    } else if (createdAt > baseline && createdAt > oldestAllowed) {
+      fresh.push({ message, order: createdAt });
+    }
   }
-  
-  if (document.hidden || state.isTabJustFocused) {
-    // [DEBUG] タブフォーカス直後の誤爆防止期間によるスキップ
-    // if (state.isTabJustFocused) console.log("[Ccfolia SW2.5 Helper] Skipped: Tab focus grace period active.");
+
+  if (!foundAny) {
+    if (!state.warnedNoMessage) {
+      state.warnedNoMessage = true;
+      console.warn(`${LOG_PREFIX} Chat rows found but message data could not be read. Ccfolia's structure may have changed.`);
+    }
     return;
   }
 
-  const leafMessages = extractLeafMessages(rootNode);
-  // [DEBUG] 取得したメッセージ内で「＞」を含むテキストノードの数
-  // if (leafMessages.length > 0) console.log(`[Ccfolia SW2.5 Helper] Found ${leafMessages.length} leaf message(s) containing dice marker.`);
+  state.highWater = newest;
 
-  const uniqueSignatures = new Set();
-
-  for (const leaf of leafMessages) {
-    if (state.processedNodes.has(leaf)) continue;
-    state.processedNodes.add(leaf);
-
-    const signature = getMessageSignature(leaf);
-    // [DEBUG] メッセージ全体から抽出されたテキスト（シグネチャ）の確認
-    // console.log(`[Ccfolia SW2.5 Helper] Target signature: "${signature}"`);
-
-    if (uniqueSignatures.has(signature)) {
-      // [DEBUG] 同一バッチ内で重複したシグネチャのスキップ
-      // console.log(`[Ccfolia SW2.5 Helper] Skipped: Duplicate signature in current DOM mutation batch.`);
-      continue;
-    }
-    uniqueSignatures.add(signature);
-
-    const currentDOMCount = domSignatureCounts.get(signature) || 0;
-    const processedCount = state.processedSignatureCounts.get(signature) || 0;
-    
-    // [DEBUG] DOM上の出現回数と処理済み回数の比較（未処理判定のコアロジック）
-    // console.log(`[Ccfolia SW2.5 Helper] Count check - DOM: ${currentDOMCount}, Processed: ${processedCount}`);
-
-    if (currentDOMCount <= processedCount) {
-      // [DEBUG] 既に処理済みのメッセージとしてのスキップ
-      // console.log(`[Ccfolia SW2.5 Helper] Skipped: Signature already processed.`);
-      continue;
-    }
-
-    const rolls = splitMultiRolls(signature);
-    let matchedAny = false;
-
-    for (const rollText of rolls) {
-      const actions = parseDiceResult(rollText);
-      // [DEBUG] メッセージから抽出された全アクション（回転、自動成功など）
-      // if (actions.length > 0) console.log(`[Ccfolia SW2.5 Helper] Parsed actions from "${rollText}":`, actions);
-      
-      for (const action of actions) {
-        const command = determineCommand(action);
-        if (!command) continue;
-
-        // [DEBUG] 送信キューにカットインコマンドが登録される際のアクション
-        // console.log(`[Ccfolia SW2.5 Helper] Detected event:`, action, `-> Queueing: ${command}`);
-        queueChatMessage(command);
-        matchedAny = true;
-      }
-    }
-
-    if (matchedAny) {
-      markProcessed(signature);
+  fresh.sort((a, b) => a.order - b.order);
+  for (const { message } of fresh) {
+    try {
+      handleNewMessage(message);
+    } catch (e) {
+      console.error(`${LOG_PREFIX} Error handling message:`, e);
     }
   }
 }
 
 /**
- * Initialize and start the MutationObserver on the chat container.
+ * Observe the whole document: the chat log element itself is replaced on
+ * channel switches / layout changes, so a fixed container cannot be tracked reliably.
  */
-function startChatObserver() {
-  try {
-    const container = findChatContainer();
-    if (!container) {
-      setTimeout(startChatObserver, 1000);
-      return;
-    }
-
-    state.observedContainer = container;
-    console.log('[Ccfolia SW2.5 Helper] Observer initialized. Monitoring chat updates...');
-
-    // Reset tracking lists on start
-    state.processedSignatureCounts.clear();
-    state.processedSignaturesQueue.length = 0;
-
-    // Mark all existing messages as processed initially
-    const leafMessages = extractLeafMessages(container);
-    for (const leaf of leafMessages) {
-      state.processedNodes.add(leaf);
-      const signature = getMessageSignature(leaf);
-      markProcessed(signature);
-    }
-
-    let pendingNodes = [];
-    let processingTimeout = null;
-
-    state.chatObserver = new MutationObserver((mutations) => {
+function startObserver() {
+  let timer = null;
+  // Throttle (not debounce): continuous mutations elsewhere must not postpone the scan
+  const schedule = () => {
+    if (timer) return;
+    timer = setTimeout(() => {
+      timer = null;
       try {
-        for (const mutation of mutations) {
-          if (mutation.type === 'childList') {
-            for (const node of mutation.addedNodes) {
-              if (node.nodeType === Node.ELEMENT_NODE) {
-                pendingNodes.push(node);
-              }
-            }
-          }
-        }
-
-        // Debounce processing to handle rapid consecutive node additions
-        clearTimeout(processingTimeout);
-        processingTimeout = setTimeout(() => {
-          if (pendingNodes.length === 0) return;
-
-          try {
-            const currentContainer = findChatContainer();
-            const domSignatureCounts = countDOMSignatures(currentContainer);
-
-            // Clean up old signatures no longer present on DOM
-            gcProcessedSignatures(domSignatureCounts);
-
-            // Handle massive updates silently (e.g. room load or channel switch)
-            if (pendingNodes.length > CONFIG.BULK_RENDER_THRESHOLD) {
-              // [DEBUG] 大量ノード追加時の一括スキップ処理ログ
-              // console.log(`[Ccfolia SW2.5 Helper] Bulk render detected (${pendingNodes.length} nodes). Syncing count silently.`);
-              syncNodesSilently(pendingNodes);
-              pendingNodes = [];
-              return;
-            }
-
-            // Process newly added nodes
-            for (const node of pendingNodes) {
-              try {
-                processIndividualMessages(node, domSignatureCounts);
-              } catch (e) {
-                console.error("[Ccfolia SW2.5 Helper] Error in processIndividualMessages:", e);
-              }
-            }
-          } catch (e) {
-            console.error("[Ccfolia SW2.5 Helper] Error in debounced observer runner:", e);
-          } finally {
-            pendingNodes = [];
-          }
-        }, 50);
+        scanChatRows();
       } catch (e) {
-        console.error("[Ccfolia SW2.5 Helper] Error in MutationObserver callback:", e);
+        console.error(`${LOG_PREFIX} Error in scan:`, e);
       }
-    });
+    }, CONFIG.SCAN_THROTTLE);
+  };
 
-    state.chatObserver.observe(container, {
-      childList: true,
-      subtree: true
-    });
-  } catch (e) {
-    console.error("[Ccfolia SW2.5 Helper] Error in startChatObserver:", e);
-  }
+  new MutationObserver(schedule).observe(document.body, { childList: true, subtree: true });
+  schedule();
+  console.log(`${LOG_PREFIX} Observer initialized. Monitoring chat updates...`);
 }
 
 // Initial entry point
 if (document.readyState === 'loading') {
-  document.addEventListener('DOMContentLoaded', startChatObserver);
+  document.addEventListener('DOMContentLoaded', startObserver);
 } else {
-  startChatObserver();
+  startObserver();
 }
-
-// Re-initialization recovery for SPAs
-setInterval(() => {
-  try {
-    const currentContainer = findChatContainer();
-    if (state.chatObserver && (!document.body.contains(state.observedContainer) || currentContainer !== state.observedContainer)) {
-      console.log('[Ccfolia SW2.5 Helper] Chat container detached or changed. Re-initializing...');
-      state.chatObserver.disconnect();
-      state.chatObserver = null;
-      state.observedContainer = null;
-      startChatObserver();
-    }
-  } catch (e) {
-    console.error("[Ccfolia SW2.5 Helper] Error in observer check interval:", e);
-  }
-}, CONFIG.OBSERVER_RECONNECT_INTERVAL);
